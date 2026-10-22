@@ -6,8 +6,8 @@ import (
 	"testing"
 	"time"
 
-	"github.com/yugabyte/pgx/v5/pgconn/ctxwatch"
 	"github.com/stretchr/testify/require"
+	"github.com/yugabyte/pgx/v5/pgconn/ctxwatch"
 )
 
 type testHandler struct {
@@ -67,12 +67,12 @@ func TestContextWatcherUnwatchedBeforeContextCancelled(t *testing.T) {
 func TestContextWatcherMultipleWatchPanics(t *testing.T) {
 	cw := ctxwatch.NewContextWatcher(&testHandler{handleCancel: func(context.Context) {}, handleUnwatchAfterCancel: func() {}})
 
-	ctx, cancel := context.WithCancel(context.Background())
+	ctx, cancel := context.WithCancel(t.Context())
 	defer cancel()
 	cw.Watch(ctx)
 	defer cw.Unwatch()
 
-	ctx2, cancel2 := context.WithCancel(context.Background())
+	ctx2, cancel2 := context.WithCancel(t.Context())
 	defer cancel2()
 	require.Panics(t, func() { cw.Watch(ctx2) }, "Expected panic when Watch called multiple times")
 }
@@ -81,8 +81,7 @@ func TestContextWatcherUnwatchWhenNotWatchingIsSafe(t *testing.T) {
 	cw := ctxwatch.NewContextWatcher(&testHandler{handleCancel: func(context.Context) {}, handleUnwatchAfterCancel: func() {}})
 	cw.Unwatch() // unwatch when not / never watching
 
-	ctx, cancel := context.WithCancel(context.Background())
-	defer cancel()
+	ctx := t.Context()
 	cw.Watch(ctx)
 	cw.Unwatch()
 	cw.Unwatch() // double unwatch
@@ -102,21 +101,22 @@ func TestContextWatcherUnwatchIsConcurrencySafe(t *testing.T) {
 }
 
 func TestContextWatcherStress(t *testing.T) {
-	var cancelFuncCalls int64
-	var cleanupFuncCalls int64
+	var cancelFuncCalls atomic.Int64
+	var cleanupFuncCalls atomic.Int64
 
 	cw := ctxwatch.NewContextWatcher(&testHandler{
 		handleCancel: func(context.Context) {
-			atomic.AddInt64(&cancelFuncCalls, 1)
+			cancelFuncCalls.Add(1)
 		}, handleUnwatchAfterCancel: func() {
-			atomic.AddInt64(&cleanupFuncCalls, 1)
+			cleanupFuncCalls.Add(1)
 		},
 	})
 
-	cycleCount := 100000
+	cycleCount := 100_000
 
-	for i := 0; i < cycleCount; i++ {
+	for i := range cycleCount {
 		ctx, cancel := context.WithCancel(context.Background())
+		defer cancel() // satisfy linter; cancel is idempotent
 		cw.Watch(ctx)
 		if i%2 == 0 {
 			cancel()
@@ -135,8 +135,8 @@ func TestContextWatcherStress(t *testing.T) {
 		}
 	}
 
-	actualCancelFuncCalls := atomic.LoadInt64(&cancelFuncCalls)
-	actualCleanupFuncCalls := atomic.LoadInt64(&cleanupFuncCalls)
+	actualCancelFuncCalls := cancelFuncCalls.Load()
+	actualCleanupFuncCalls := cleanupFuncCalls.Load()
 
 	if actualCancelFuncCalls == 0 {
 		t.Fatal("actualCancelFuncCalls == 0")
@@ -155,7 +155,7 @@ func TestContextWatcherStress(t *testing.T) {
 func BenchmarkContextWatcherUncancellable(b *testing.B) {
 	cw := ctxwatch.NewContextWatcher(&testHandler{handleCancel: func(context.Context) {}, handleUnwatchAfterCancel: func() {}})
 
-	for i := 0; i < b.N; i++ {
+	for b.Loop() {
 		cw.Watch(context.Background())
 		cw.Unwatch()
 	}
@@ -164,7 +164,7 @@ func BenchmarkContextWatcherUncancellable(b *testing.B) {
 func BenchmarkContextWatcherCancelled(b *testing.B) {
 	cw := ctxwatch.NewContextWatcher(&testHandler{handleCancel: func(context.Context) {}, handleUnwatchAfterCancel: func() {}})
 
-	for i := 0; i < b.N; i++ {
+	for b.Loop() {
 		ctx, cancel := context.WithCancel(context.Background())
 		cw.Watch(ctx)
 		cancel()
@@ -175,10 +175,9 @@ func BenchmarkContextWatcherCancelled(b *testing.B) {
 func BenchmarkContextWatcherCancellable(b *testing.B) {
 	cw := ctxwatch.NewContextWatcher(&testHandler{handleCancel: func(context.Context) {}, handleUnwatchAfterCancel: func() {}})
 
-	ctx, cancel := context.WithCancel(context.Background())
-	defer cancel()
+	ctx := b.Context()
 
-	for i := 0; i < b.N; i++ {
+	for b.Loop() {
 		cw.Watch(ctx)
 		cw.Unwatch()
 	}

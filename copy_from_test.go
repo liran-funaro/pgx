@@ -11,6 +11,7 @@ import (
 	"github.com/stretchr/testify/require"
 	"github.com/yugabyte/pgx/v5"
 	"github.com/yugabyte/pgx/v5/pgconn"
+	"github.com/yugabyte/pgx/v5/pgtype"
 	"github.com/yugabyte/pgx/v5/pgxtest"
 )
 
@@ -283,7 +284,7 @@ func TestConnCopyFromLarge(t *testing.T) {
 
 	inputRows := [][]any{}
 
-	for i := 0; i < 10000; i++ {
+	for range 10_000 {
 		inputRows = append(inputRows, []any{int16(0), int32(1), int64(2), "abc", "efg", time.Date(2000, 1, 1, 0, 0, 0, 0, time.UTC), tzedTime, []byte{111, 111, 111, 111}})
 	}
 
@@ -452,6 +453,106 @@ func TestConnCopyFromJSON(t *testing.T) {
 	ensureConnValid(t, conn)
 }
 
+func TestConnCopyFromTSVector(t *testing.T) {
+	t.Parallel()
+
+	ctx, cancel := context.WithTimeout(context.Background(), 120*time.Second)
+	defer cancel()
+
+	conn := mustConnectString(t, os.Getenv("PGX_TEST_DATABASE"))
+	defer closeConn(t, conn)
+
+	pgxtest.SkipCockroachDB(t, conn, "CockroachDB handles tsvector escaping differently")
+
+	tx, err := conn.Begin(ctx)
+	require.NoError(t, err)
+	defer tx.Rollback(ctx)
+
+	_, err = tx.Exec(ctx, `create temporary table tmp_tsv (id int, t tsvector)`)
+	require.NoError(t, err)
+
+	inputRows := [][]any{
+		// Text format: core functionality.
+		{1, `'a':1A 'cat':5 'fat':2B,4C`}, // Multiple lexemes with positions and weights.
+		{2, `'bare'`},                     // Single lexeme with no positions.
+		{3, `'multi':1,2,3,4,5`},          // Multiple positions (default weight D).
+		{4, `'test':1A,2B,3C,4D`},         // All four weights on one lexeme.
+		{5, `'word':1D`},                  // Explicit weight D (normalizes to no suffix).
+		{6, `'high':16383A`},              // High position number (near 14-bit max).
+
+		// Text format: escaping.
+		{7, `'don''t'`}, // Quote escaping (doubled single quote).
+		{8, `'don\'t'`}, // Quote escaping (backslash).
+		{9, `'ab\\c'`},  // Backslash in lexeme.
+		{10, `'\ foo'`}, // Escaped space.
+
+		// Text format: special characters.
+		{11, `'café' 'naïve'`}, // Unicode lexemes.
+		{12, `'a:b' 'c,d'`},    // Delimiter-like characters (colon, comma).
+
+		// Struct format: tests binary encoding path.
+		{13, pgtype.TSVector{
+			Lexemes: []pgtype.TSVectorLexeme{
+				{Word: "alpha", Positions: []pgtype.TSVectorPosition{{Position: 1, Weight: pgtype.TSVectorWeightA}}},
+				{Word: "beta", Positions: []pgtype.TSVectorPosition{{Position: 2, Weight: pgtype.TSVectorWeightB}}},
+				{Word: "gamma", Positions: nil},
+			},
+			Valid: true,
+		}},
+		{14, pgtype.TSVector{Valid: true}}, // Empty valid tsvector (no lexemes).
+
+		// NULL handling.
+		{15, pgtype.TSVector{Valid: false}}, // Invalid (NULL) TSVector struct.
+		{16, nil},                           // Nil value.
+	}
+
+	copyCount, err := conn.CopyFrom(ctx, pgx.Identifier{"tmp_tsv"}, []string{"id", "t"}, pgx.CopyFromRows(inputRows))
+	require.NoError(t, err)
+	require.EqualValues(t, len(inputRows), copyCount)
+
+	rows, err := conn.Query(ctx, "select id, t::text from tmp_tsv order by id nulls last")
+	require.NoError(t, err)
+
+	var outputRows [][]any
+	for rows.Next() {
+		row, err := rows.Values()
+		require.NoError(t, err)
+		outputRows = append(outputRows, row)
+	}
+	require.NoError(t, rows.Err())
+
+	expectedOutputRows := [][]any{
+		// Text format: core functionality.
+		{int32(1), `'a':1A 'cat':5 'fat':2B,4C`},
+		{int32(2), `'bare'`},
+		{int32(3), `'multi':1,2,3,4,5`},
+		{int32(4), `'test':1A,2B,3C,4`},
+		{int32(5), `'word':1`},
+		{int32(6), `'high':16383A`},
+
+		// Text format: escaping.
+		{int32(7), `'don''t'`},
+		{int32(8), `'don''t'`},
+		{int32(9), `'ab\\c'`},
+		{int32(10), `' foo'`},
+
+		// Text format: special characters.
+		{int32(11), `'café' 'naïve'`},
+		{int32(12), `'a:b' 'c,d'`},
+
+		// Struct format.
+		{int32(13), `'alpha':1A 'beta':2B 'gamma'`},
+		{int32(14), ``},
+
+		// NULL handling.
+		{int32(15), nil},
+		{int32(16), nil},
+	}
+	require.Equal(t, expectedOutputRows, outputRows)
+
+	ensureConnValid(t, conn)
+}
+
 type clientFailSource struct {
 	count int
 	err   error
@@ -467,7 +568,7 @@ func (cfs *clientFailSource) Values() ([]any, error) {
 		cfs.err = fmt.Errorf("client error")
 		return nil, cfs.err
 	}
-	return []any{make([]byte, 100000)}, nil
+	return []any{make([]byte, 100_000)}, nil
 }
 
 func (cfs *clientFailSource) Err() error {
@@ -546,7 +647,7 @@ func (fs *failSource) Values() ([]any, error) {
 	if fs.count == 3 {
 		return []any{nil}, nil
 	}
-	return []any{make([]byte, 100000)}, nil
+	return []any{make([]byte, 100_000)}, nil
 }
 
 func (fs *failSource) Err() error {
@@ -717,7 +818,7 @@ func (cfs *clientFinalErrSource) Next() bool {
 }
 
 func (cfs *clientFinalErrSource) Values() ([]any, error) {
-	return []any{make([]byte, 100000)}, nil
+	return []any{make([]byte, 100_000)}, nil
 }
 
 func (cfs *clientFinalErrSource) Err() error {
@@ -783,7 +884,7 @@ func TestConnCopyFromAutomaticStringConversion(t *testing.T) {
 		a int8
 	)`)
 
-	inputRows := [][]interface{}{
+	inputRows := [][]any{
 		{"42"},
 		{"7"},
 		{8},
@@ -816,7 +917,7 @@ func TestConnCopyFromAutomaticStringConversionArray(t *testing.T) {
 		a numeric[]
 	)`)
 
-	inputRows := [][]interface{}{
+	inputRows := [][]any{
 		{[]string{"42"}},
 		{[]string{"7"}},
 		{[]string{"8", "9"}},
@@ -850,7 +951,7 @@ func TestCopyFromFunc(t *testing.T) {
 
 	const channelItems = 10
 	go func() {
-		for i := 0; i < channelItems; i++ {
+		for i := range channelItems {
 			dataCh <- i
 		}
 		close(dataCh)

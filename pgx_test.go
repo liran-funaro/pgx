@@ -3,8 +3,8 @@ package pgx_test
 import (
 	"context"
 	"os"
-	"testing"
 	"strings"
+	"testing"
 
 	"github.com/yugabyte/pgx/v5"
 	_ "github.com/yugabyte/pgx/v5/stdlib"

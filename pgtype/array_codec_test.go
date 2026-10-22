@@ -2,6 +2,7 @@ package pgtype_test
 
 import (
 	"context"
+	"database/sql/driver"
 	"encoding/hex"
 	"reflect"
 	"strings"
@@ -9,7 +10,7 @@ import (
 
 	"github.com/stretchr/testify/assert"
 	"github.com/stretchr/testify/require"
-	pgx "github.com/yugabyte/pgx/v5"
+	"github.com/yugabyte/pgx/v5"
 	"github.com/yugabyte/pgx/v5/pgtype"
 	"github.com/yugabyte/pgx/v5/pgxtest"
 )
@@ -85,6 +86,92 @@ func TestArrayCodecFlatArrayString(t *testing.T) {
 	})
 }
 
+func TestArrayCodecEncodeTextArrayQuotesInternalWhitespace(t *testing.T) {
+	buf, err := pgtype.NewMap().Encode(pgtype.TextArrayOID, pgtype.TextFormatCode, []string{"has space", "two words", "nospaces"}, nil)
+	require.NoError(t, err)
+	require.Equal(t, `{"has space","two words",nospaces}`, string(buf))
+}
+
+func TestArrayCodecDecodeTextBoxArrayUsesBoxDelimiter(t *testing.T) {
+	var boxes []pgtype.Box
+	err := pgtype.NewMap().Scan(pgtype.BoxArrayOID, pgtype.TextFormatCode, []byte(`{(2,2),(1,1);(4,4),(3,3)}`), &boxes)
+	require.NoError(t, err)
+	require.Equal(t, []pgtype.Box{
+		{P: [2]pgtype.Vec2{{X: 2, Y: 2}, {X: 1, Y: 1}}, Valid: true},
+		{P: [2]pgtype.Vec2{{X: 4, Y: 4}, {X: 3, Y: 3}}, Valid: true},
+	}, boxes)
+}
+
+func TestArrayCodecEncodeTextBoxArrayUsesBoxDelimiter(t *testing.T) {
+	buf, err := pgtype.NewMap().Encode(pgtype.BoxArrayOID, pgtype.TextFormatCode, []pgtype.Box{
+		{P: [2]pgtype.Vec2{{X: 2, Y: 2}, {X: 1, Y: 1}}, Valid: true},
+		{P: [2]pgtype.Vec2{{X: 4, Y: 4}, {X: 3, Y: 3}}, Valid: true},
+	}, nil)
+	require.NoError(t, err)
+	require.Equal(t, `{"(2,2),(1,1)";"(4,4),(3,3)"}`, string(buf))
+}
+
+func TestArrayCodecBoxArrayRoundTrip(t *testing.T) {
+	testCases := []struct {
+		input []pgtype.Box
+	}{
+		{nil},
+		{[]pgtype.Box{}},
+		{[]pgtype.Box{
+			{P: [2]pgtype.Vec2{{X: 2, Y: 2}, {X: 1, Y: 1}}, Valid: true},
+		}},
+		{[]pgtype.Box{
+			{P: [2]pgtype.Vec2{{X: 2, Y: 2}, {X: 1, Y: 1}}, Valid: true},
+			{P: [2]pgtype.Vec2{{X: 4, Y: 4}, {X: 3, Y: 3}}, Valid: true},
+		}},
+		{[]pgtype.Box{
+			{P: [2]pgtype.Vec2{{X: 2, Y: 2}, {X: 1, Y: 1}}, Valid: true},
+			{},
+			{P: [2]pgtype.Vec2{{X: 4, Y: 4}, {X: 3, Y: 3}}, Valid: true},
+		}},
+	}
+
+	ctr := defaultConnTestRunner
+	ctr.AfterConnect = func(ctx context.Context, t testing.TB, conn *pgx.Conn) {
+		pgxtest.SkipCockroachDB(t, conn, "Server does not support box type")
+	}
+
+	ctr.RunTest(context.Background(), t, func(ctx context.Context, t testing.TB, conn *pgx.Conn) {
+		for i, testCase := range testCases {
+			for _, queryMode := range pgxtest.AllQueryExecModes {
+				var out []pgtype.Box
+				err := conn.QueryRow(ctx, "select $1::box[]", queryMode, testCase.input).Scan(&out)
+				if err != nil {
+					t.Fatalf("i=%d input=%#v queryMode=%s: Scan failed: %s",
+						i, testCase.input, queryMode, err)
+				}
+				if !reflect.DeepEqual(out, testCase.input) {
+					t.Errorf("i=%d input=%#v queryMode=%s: not equal output=%#v",
+						i, testCase.input, queryMode, out)
+				}
+			}
+		}
+
+		// The box delimiter only matters in the text format, so also confirm a
+		// server-produced text box[] scans correctly in the modes that return
+		// text format results.
+		for _, queryMode := range []pgx.QueryExecMode{pgx.QueryExecModeSimpleProtocol, pgx.QueryExecModeExec} {
+			var out []pgtype.Box
+			err := conn.QueryRow(ctx, "select array['((2,2),(1,1))'::box, '((4,4),(3,3))'::box]", queryMode).Scan(&out)
+			if err != nil {
+				t.Fatalf("queryMode=%s: Scan failed: %s", queryMode, err)
+			}
+			expected := []pgtype.Box{
+				{P: [2]pgtype.Vec2{{X: 2, Y: 2}, {X: 1, Y: 1}}, Valid: true},
+				{P: [2]pgtype.Vec2{{X: 4, Y: 4}, {X: 3, Y: 3}}, Valid: true},
+			}
+			if !reflect.DeepEqual(out, expected) {
+				t.Errorf("queryMode=%s: not equal output=%#v", queryMode, out)
+			}
+		}
+	})
+}
+
 func TestArrayCodecArray(t *testing.T) {
 	ctr := defaultConnTestRunner
 	ctr.AfterConnect = func(ctx context.Context, t testing.TB, conn *pgx.Conn) {
@@ -113,6 +200,44 @@ func TestArrayCodecArray(t *testing.T) {
 			assert.NoErrorf(t, err, "%d", i)
 			assert.Equalf(t, tt.expected, actual, "%d", i)
 		}
+	})
+}
+
+func TestArrayCodecPointerToNil(t *testing.T) {
+	pgxtest.RunWithQueryExecModes(context.Background(), t, defaultConnTestRunner, nil, func(ctx context.Context, t testing.TB, conn *pgx.Conn) {
+		n := int32(42)
+		input := []*int32{&n, nil}
+		var actual []*int32
+		err := conn.QueryRow(
+			ctx,
+			"select $1::int[]",
+			input,
+		).Scan(&actual)
+		require.NoError(t, err)
+		require.Equal(t, input, actual)
+	})
+}
+
+type jsonbValuerSlice []int
+
+func (v jsonbValuerSlice) Value() (driver.Value, error) {
+	if v == nil {
+		return []byte("[]"), nil
+	}
+	return []byte("[1]"), nil
+}
+
+func TestArrayCodecTypedNilElementWithValuer(t *testing.T) {
+	pgxtest.RunWithQueryExecModes(context.Background(), t, defaultConnTestRunner, pgxtest.KnownOIDQueryExecModes, func(ctx context.Context, t testing.TB, conn *pgx.Conn) {
+		input := []jsonbValuerSlice{nil, nil}
+		var actual []string
+		err := conn.QueryRow(
+			ctx,
+			"select $1::jsonb[]::text[]",
+			input,
+		).Scan(&actual)
+		require.NoError(t, err)
+		require.Equal(t, []string{"[]", "[]"}, actual)
 	})
 }
 

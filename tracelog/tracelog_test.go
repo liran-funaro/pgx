@@ -10,12 +10,12 @@ import (
 	"testing"
 	"time"
 
+	"github.com/stretchr/testify/assert"
+	"github.com/stretchr/testify/require"
 	"github.com/yugabyte/pgx/v5"
 	"github.com/yugabyte/pgx/v5/pgxpool"
 	"github.com/yugabyte/pgx/v5/pgxtest"
 	"github.com/yugabyte/pgx/v5/tracelog"
-	"github.com/stretchr/testify/assert"
-	"github.com/stretchr/testify/require"
 	"golang.org/x/sync/errgroup"
 )
 
@@ -112,7 +112,7 @@ func TestLoggerFunc(t *testing.T) {
 	logger := log.New(&buf, "", 0)
 
 	createAdapterFn := func(logger *log.Logger) tracelog.LoggerFunc {
-		return func(ctx context.Context, level tracelog.LogLevel, msg string, data map[string]interface{}) {
+		return func(ctx context.Context, level tracelog.LogLevel, msg string, data map[string]any) {
 			logger.Printf("%s", testMsg)
 		}
 	}
@@ -202,29 +202,29 @@ func TestLogQueryArgsHandlesUTF8(t *testing.T) {
 	pgxtest.RunWithQueryExecModes(ctx, t, ctr, nil, func(ctx context.Context, t testing.TB, conn *pgx.Conn) {
 		logger.Clear() // Clear any logs written when establishing connection
 
-		var s string
-		for i := 0; i < 63; i++ {
-			s += "0"
+		var s strings.Builder
+		for range 63 {
+			s.WriteString("0")
 		}
-		s += "😊"
+		s.WriteString("😊")
 
-		_, err := conn.Exec(ctx, `select $1::text`, s)
+		_, err := conn.Exec(ctx, `select $1::text`, s.String())
 		require.NoError(t, err)
 
 		logs := logger.FilterByMsg("Query")
 		require.Len(t, logs, 1)
 		require.Equal(t, tracelog.LogLevelInfo, logs[0].lvl)
-		require.Equal(t, s, logs[0].data["args"].([]any)[0])
+		require.Equal(t, s.String(), logs[0].data["args"].([]any)[0])
 
 		logger.Clear()
 
-		_, err = conn.Exec(ctx, `select $1::text`, s+"000")
+		_, err = conn.Exec(ctx, `select $1::text`, s.String()+"000")
 		require.NoError(t, err)
 
 		logs = logger.FilterByMsg("Query")
 		require.Len(t, logs, 1)
 		require.Equal(t, tracelog.LogLevelInfo, logs[0].lvl)
-		require.Equal(t, s+" (truncated 3 bytes)", logs[0].data["args"].([]any)[0])
+		require.Equal(t, s.String()+" (truncated 3 bytes)", logs[0].data["args"].([]any)[0])
 	})
 }
 
@@ -339,6 +339,8 @@ func TestLogBatchStatementsOnExec(t *testing.T) {
 	}
 
 	pgxtest.RunWithQueryExecModes(ctx, t, ctr, nil, func(ctx context.Context, t testing.TB, conn *pgx.Conn) {
+		pgxtest.SkipCockroachDB(t, conn, "CockroachDB auto commits DDL by default")
+
 		logger.Clear() // Clear any logs written when establishing connection
 
 		batch := &pgx.Batch{}
@@ -570,7 +572,7 @@ func TestConcurrentUsage(t *testing.T) {
 	require.NoError(t, err)
 	config.ConnConfig.Tracer = tracer
 
-	for i := 0; i < 50; i++ {
+	for range 50 {
 		func() {
 			pool, err := pgxpool.NewWithConfig(ctx, config)
 			require.NoError(t, err)
@@ -579,7 +581,7 @@ func TestConcurrentUsage(t *testing.T) {
 
 			eg := errgroup.Group{}
 
-			for i := 0; i < 5; i++ {
+			for range 5 {
 				eg.Go(func() error {
 					_, err := pool.Exec(ctx, `select 1`)
 					return err

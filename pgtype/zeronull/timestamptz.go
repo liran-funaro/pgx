@@ -10,9 +10,14 @@ import (
 
 type Timestamptz time.Time
 
+// SkipUnderlyingTypePlan implements the [pgtype.SkipUnderlyingTypePlanner] interface.
+func (Timestamptz) SkipUnderlyingTypePlan() {}
+
+// ScanTimestamptz implements the [pgtype.TimestamptzScanner] interface.
 func (ts *Timestamptz) ScanTimestamptz(v pgtype.Timestamptz) error {
 	if !v.Valid {
 		*ts = Timestamptz{}
+		return nil
 	}
 
 	switch v.InfinityModifier {

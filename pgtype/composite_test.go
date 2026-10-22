@@ -5,9 +5,9 @@ import (
 	"fmt"
 	"testing"
 
+	"github.com/stretchr/testify/require"
 	pgx "github.com/yugabyte/pgx/v5"
 	"github.com/yugabyte/pgx/v5/pgtype"
-	"github.com/stretchr/testify/require"
 )
 
 func TestCompositeCodecTranscode(t *testing.T) {
@@ -45,6 +45,67 @@ create type ct_test as (
 			require.NoErrorf(t, err, "%v", format.name)
 			require.EqualValuesf(t, "hi", a, "%v", format.name)
 			require.EqualValuesf(t, 42, b, "%v", format.name)
+		}
+	})
+}
+
+// stringerInt32 is a custom int32 type that implements fmt.Stringer, similar to protobuf enums.
+type stringerInt32 int32
+
+const (
+	stringerInt32Foo stringerInt32 = 100
+	stringerInt32Bar stringerInt32 = 200
+)
+
+func (s stringerInt32) String() string {
+	switch s {
+	case stringerInt32Foo:
+		return "FOO"
+	case stringerInt32Bar:
+		return "BAR"
+	default:
+		return "UNKNOWN"
+	}
+}
+
+// https://github.com/jackc/pgx/discussions/2527
+func TestCompositeCodecTranscodeWithStringerInt(t *testing.T) {
+	defaultConnTestRunner.RunTest(context.Background(), t, func(ctx context.Context, t testing.TB, conn *pgx.Conn) {
+		_, err := conn.Exec(ctx, `drop type if exists ct_stringer_test;
+
+create type ct_stringer_test as (
+	a text,
+	b smallint
+);`)
+		require.NoError(t, err)
+		defer conn.Exec(ctx, "drop type ct_stringer_test")
+
+		dt, err := conn.LoadType(ctx, "ct_stringer_test")
+		require.NoError(t, err)
+		conn.TypeMap().RegisterType(dt)
+
+		formats := []struct {
+			name string
+			code int16
+		}{
+			{name: "TextFormat", code: pgx.TextFormatCode},
+			{name: "BinaryFormat", code: pgx.BinaryFormatCode},
+		}
+
+		// Pass the same stringerInt32 value for both fields. The text field should get the Stringer value
+		// ("BAR") and the smallint field should get the integer value (200).
+		for _, format := range formats {
+			var a string
+			var b int16
+
+			err := conn.QueryRow(ctx, "select $1::ct_stringer_test", pgx.QueryResultFormats{format.code},
+				pgtype.CompositeFields{stringerInt32Bar, stringerInt32Bar},
+			).Scan(
+				pgtype.CompositeFields{&a, &b},
+			)
+			require.NoErrorf(t, err, "%v", format.name)
+			require.EqualValuesf(t, "BAR", a, "%v", format.name)
+			require.EqualValuesf(t, 200, b, "%v", format.name)
 		}
 	})
 }
@@ -159,6 +220,218 @@ create type point3d as (
 	})
 }
 
+type parent struct {
+	Name     string
+	Location *point3d
+}
+
+func (p parent) IsNull() bool {
+	return false
+}
+
+func (p parent) Index(i int) any {
+	switch i {
+	case 0:
+		return p.Name
+	case 1:
+		return p.Location
+	default:
+		panic("invalid index")
+	}
+}
+
+func (p *parent) ScanNull() error {
+	return fmt.Errorf("cannot scan NULL into parent")
+}
+
+func (p *parent) ScanIndex(i int) any {
+	switch i {
+	case 0:
+		return &p.Name
+	case 1:
+		return &p.Location
+	default:
+		panic("invalid index")
+	}
+}
+
+// https://github.com/jackc/pgx/issues/2453
+func TestCompositeCodecTranscodeStructWithNilPointer(t *testing.T) {
+	defaultConnTestRunner.RunTest(context.Background(), t, func(ctx context.Context, t testing.TB, conn *pgx.Conn) {
+		skipCockroachDB(t, "Server does not support nested composite types")
+
+		_, err := conn.Exec(ctx, `drop type if exists parent;
+drop type if exists point3d;
+
+create type point3d as (
+	x float8,
+	y float8,
+	z float8
+);
+
+create type parent as (
+	name text,
+	location point3d
+);`)
+		require.NoError(t, err)
+		defer conn.Exec(ctx, "drop type parent")
+		defer conn.Exec(ctx, "drop type point3d")
+
+		dataTypes, err := conn.LoadTypes(ctx, []string{"point3d", "parent"})
+		require.NoError(t, err)
+		conn.TypeMap().RegisterTypes(dataTypes)
+
+		formats := []struct {
+			name string
+			code int16
+		}{
+			{name: "TextFormat", code: pgx.TextFormatCode},
+			{name: "BinaryFormat", code: pgx.BinaryFormatCode},
+		}
+
+		for _, format := range formats {
+			input := parent{Name: "test", Location: nil}
+			var output parent
+			err := conn.QueryRow(ctx, "select $1::parent", pgx.QueryResultFormats{format.code}, input).Scan(&output)
+			require.NoErrorf(t, err, "%v", format.name)
+			require.Equalf(t, input, output, "%v", format.name)
+		}
+	})
+}
+
+type parentWithSlice struct {
+	Name      string
+	Locations []*point3d
+}
+
+func (p parentWithSlice) IsNull() bool {
+	return false
+}
+
+func (p parentWithSlice) Index(i int) any {
+	switch i {
+	case 0:
+		return p.Name
+	case 1:
+		return p.Locations
+	default:
+		panic("invalid index")
+	}
+}
+
+func (p *parentWithSlice) ScanNull() error {
+	return fmt.Errorf("cannot scan NULL into parent")
+}
+
+func (p *parentWithSlice) ScanIndex(i int) any {
+	switch i {
+	case 0:
+		return &p.Name
+	case 1:
+		return &p.Locations
+	default:
+		panic("invalid index")
+	}
+}
+
+// https://github.com/jackc/pgx/issues/2453
+func TestCompositeCodecTranscodeStructWithSliceOfNilPointer(t *testing.T) {
+	defaultConnTestRunner.RunTest(context.Background(), t, func(ctx context.Context, t testing.TB, conn *pgx.Conn) {
+		skipCockroachDB(t, "Server does not support nested composite types")
+
+		_, err := conn.Exec(ctx, `drop type if exists parent;
+drop type if exists point3d;
+
+create type point3d as (
+	x float8,
+	y float8,
+	z float8
+);
+
+create type parent_with_slice as (
+	name text,
+	locations point3d[]
+);`)
+		require.NoError(t, err)
+		defer conn.Exec(ctx, "drop type parent_with_slice")
+		defer conn.Exec(ctx, "drop type point3d")
+
+		dataTypes, err := conn.LoadTypes(ctx, []string{"point3d", "parent_with_slice"})
+		require.NoError(t, err)
+		conn.TypeMap().RegisterTypes(dataTypes)
+
+		formats := []struct {
+			name string
+			code int16
+		}{
+			{name: "TextFormat", code: pgx.TextFormatCode},
+			{name: "BinaryFormat", code: pgx.BinaryFormatCode},
+		}
+
+		for _, format := range formats {
+			input := parentWithSlice{Name: "test", Locations: []*point3d{nil}}
+			var output parentWithSlice
+			err := conn.QueryRow(ctx, "select $1::parent_with_slice", pgx.QueryResultFormats{format.code}, input).Scan(&output)
+			require.NoErrorf(t, err, "%v", format.name)
+			require.Equalf(t, input, output, "%v", format.name)
+		}
+	})
+}
+
+type compositeWithJsonbValuer struct {
+	Name string
+	Data jsonbValuerSlice
+}
+
+func (c compositeWithJsonbValuer) IsNull() bool { return false }
+
+func (c compositeWithJsonbValuer) Index(i int) any {
+	switch i {
+	case 0:
+		return c.Name
+	case 1:
+		return c.Data
+	default:
+		panic("invalid index")
+	}
+}
+
+func TestCompositeCodecTypedNilFieldWithValuer(t *testing.T) {
+	defaultConnTestRunner.RunTest(context.Background(), t, func(ctx context.Context, t testing.TB, conn *pgx.Conn) {
+		_, err := conn.Exec(ctx, `drop type if exists composite_with_jsonb;
+create type composite_with_jsonb as (
+	name text,
+	data jsonb
+);`)
+		require.NoError(t, err)
+		defer conn.Exec(ctx, "drop type composite_with_jsonb")
+
+		dt, err := conn.LoadType(ctx, "composite_with_jsonb")
+		require.NoError(t, err)
+		conn.TypeMap().RegisterType(dt)
+
+		formats := []struct {
+			name string
+			code int16
+		}{
+			{name: "TextFormat", code: pgx.TextFormatCode},
+			{name: "BinaryFormat", code: pgx.BinaryFormatCode},
+		}
+
+		for _, format := range formats {
+			input := compositeWithJsonbValuer{Name: "test", Data: nil}
+			var gotName, gotData string
+			err := conn.QueryRow(ctx,
+				"select (r).name, (r).data::text from (select $1::composite_with_jsonb as r) s",
+				pgx.QueryResultFormats{format.code}, input,
+			).Scan(&gotName, &gotData)
+			require.NoErrorf(t, err, "%v", format.name)
+			require.Equalf(t, "test", gotName, "%v", format.name)
+			require.Equalf(t, "[]", gotData, "%v", format.name)
+		}
+	})
+}
+
 func TestCompositeCodecDecodeValue(t *testing.T) {
 	defaultConnTestRunner.RunTest(context.Background(), t, func(ctx context.Context, t testing.TB, conn *pgx.Conn) {
 		_, err := conn.Exec(ctx, `drop type if exists point3d;
@@ -239,4 +512,24 @@ create table point3d (
 			require.Equalf(t, input, output, "%v", format.name)
 		}
 	})
+}
+
+// A quoted field can consume the final ')' of a composite text value, e.g.
+// `(")` or an escape before the end like `("\)`. The scanner must report an
+// unterminated field instead of reading past the end of the source.
+func TestCompositeTextScannerUnterminatedQuotedField(t *testing.T) {
+	for _, src := range []string{`(")`, `("\)`, `(""")`} {
+		scanner := pgtype.NewCompositeTextScanner(pgtype.NewMap(), []byte(src))
+		for scanner.Next() {
+		}
+		require.Errorf(t, scanner.Err(), "src %q", src)
+	}
+}
+
+func TestCompositeTextScannerEmptyQuotedField(t *testing.T) {
+	scanner := pgtype.NewCompositeTextScanner(pgtype.NewMap(), []byte(`("")`))
+	require.True(t, scanner.Next())
+	require.Equal(t, []byte{}, scanner.Bytes())
+	require.False(t, scanner.Next())
+	require.NoError(t, scanner.Err())
 }

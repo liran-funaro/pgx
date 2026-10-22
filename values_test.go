@@ -3,7 +3,7 @@ package pgx_test
 import (
 	"bytes"
 	"context"
-	"fmt"
+	"encoding/json"
 	"net"
 	"os"
 	"reflect"
@@ -219,10 +219,16 @@ func testJSONInt16ArrayFailureDueToOverflow(t *testing.T, conn *pgx.Conn, typena
 	if conn.PgConn().ParameterStatus("crdb_version") != "" && typename == "json" {
 		fieldName = "jsonb" // Seems like CockroachDB treats json as jsonb.
 	}
-	expectedMessage := fmt.Sprintf("can't scan into dest[0] (col: %s): json: cannot unmarshal number 234432 into Go value of type int16", fieldName)
-	if err == nil || err.Error() != expectedMessage {
-		t.Errorf("%s: Expected *json.UnmarshalTypeError, but got %v", typename, err)
-	}
+
+	var scanErr pgx.ScanArgError
+	require.ErrorAs(t, err, &scanErr)
+	assert.Equal(t, 0, scanErr.ColumnIndex)
+	assert.Equal(t, fieldName, scanErr.FieldName)
+
+	var jsonErr *json.UnmarshalTypeError
+	require.ErrorAs(t, err, &jsonErr)
+	assert.Equal(t, "number 234432", jsonErr.Value)
+	assert.Equal(t, reflect.TypeFor[int16](), jsonErr.Type)
 }
 
 func testJSONStruct(t *testing.T, conn *pgx.Conn, typename string) {
@@ -600,7 +606,7 @@ func TestArrayDecoding(t *testing.T) {
 				[]bool{true, false, true},
 				&[]bool{},
 				func(t testing.TB, query, scan any) {
-					if !reflect.DeepEqual(query, *(scan.(*[]bool))) {
+					if !reflect.DeepEqual(query, *scan.(*[]bool)) {
 						t.Errorf("failed to encode bool[]")
 					}
 				},
@@ -610,7 +616,7 @@ func TestArrayDecoding(t *testing.T) {
 				[]int16{2, 4, 484, 32767},
 				&[]int16{},
 				func(t testing.TB, query, scan any) {
-					if !reflect.DeepEqual(query, *(scan.(*[]int16))) {
+					if !reflect.DeepEqual(query, *scan.(*[]int16)) {
 						t.Errorf("failed to encode smallint[]")
 					}
 				},
@@ -620,7 +626,7 @@ func TestArrayDecoding(t *testing.T) {
 				[]uint16{2, 4, 484, 32767},
 				&[]uint16{},
 				func(t testing.TB, query, scan any) {
-					if !reflect.DeepEqual(query, *(scan.(*[]uint16))) {
+					if !reflect.DeepEqual(query, *scan.(*[]uint16)) {
 						t.Errorf("failed to encode smallint[]")
 					}
 				},
@@ -630,7 +636,7 @@ func TestArrayDecoding(t *testing.T) {
 				[]int32{2, 4, 484},
 				&[]int32{},
 				func(t testing.TB, query, scan any) {
-					if !reflect.DeepEqual(query, *(scan.(*[]int32))) {
+					if !reflect.DeepEqual(query, *scan.(*[]int32)) {
 						t.Errorf("failed to encode int[]")
 					}
 				},
@@ -640,7 +646,7 @@ func TestArrayDecoding(t *testing.T) {
 				[]uint32{2, 4, 484, 2147483647},
 				&[]uint32{},
 				func(t testing.TB, query, scan any) {
-					if !reflect.DeepEqual(query, *(scan.(*[]uint32))) {
+					if !reflect.DeepEqual(query, *scan.(*[]uint32)) {
 						t.Errorf("failed to encode int[]")
 					}
 				},
@@ -650,7 +656,7 @@ func TestArrayDecoding(t *testing.T) {
 				[]int64{2, 4, 484, 9223372036854775807},
 				&[]int64{},
 				func(t testing.TB, query, scan any) {
-					if !reflect.DeepEqual(query, *(scan.(*[]int64))) {
+					if !reflect.DeepEqual(query, *scan.(*[]int64)) {
 						t.Errorf("failed to encode bigint[]")
 					}
 				},
@@ -660,7 +666,7 @@ func TestArrayDecoding(t *testing.T) {
 				[]uint64{2, 4, 484, 9223372036854775807},
 				&[]uint64{},
 				func(t testing.TB, query, scan any) {
-					if !reflect.DeepEqual(query, *(scan.(*[]uint64))) {
+					if !reflect.DeepEqual(query, *scan.(*[]uint64)) {
 						t.Errorf("failed to encode bigint[]")
 					}
 				},
@@ -670,7 +676,7 @@ func TestArrayDecoding(t *testing.T) {
 				[]string{"it's", "over", "9000!"},
 				&[]string{},
 				func(t testing.TB, query, scan any) {
-					if !reflect.DeepEqual(query, *(scan.(*[]string))) {
+					if !reflect.DeepEqual(query, *scan.(*[]string)) {
 						t.Errorf("failed to encode text[]")
 					}
 				},
@@ -681,7 +687,7 @@ func TestArrayDecoding(t *testing.T) {
 				&[]time.Time{},
 				func(t testing.TB, query, scan any) {
 					queryTimeSlice := query.([]time.Time)
-					scanTimeSlice := *(scan.(*[]time.Time))
+					scanTimeSlice := *scan.(*[]time.Time)
 					require.Equal(t, len(queryTimeSlice), len(scanTimeSlice))
 					for i := range queryTimeSlice {
 						assert.Truef(t, queryTimeSlice[i].Equal(scanTimeSlice[i]), "%d", i)
@@ -694,7 +700,7 @@ func TestArrayDecoding(t *testing.T) {
 				&[][]byte{},
 				func(t testing.TB, query, scan any) {
 					queryBytesSliceSlice := query.([][]byte)
-					scanBytesSliceSlice := *(scan.(*[][]byte))
+					scanBytesSliceSlice := *scan.(*[][]byte)
 					if len(queryBytesSliceSlice) != len(scanBytesSliceSlice) {
 						t.Errorf("failed to encode byte[][] to bytea[]: expected %d to equal %d", len(queryBytesSliceSlice), len(scanBytesSliceSlice))
 					}

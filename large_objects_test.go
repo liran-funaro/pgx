@@ -177,7 +177,7 @@ func TestLargeObjectsMultipleTransactions(t *testing.T) {
 
 	pgxtest.SkipCockroachDB(t, conn, "Server does support large objects")
 	pgxtest.SkipYugabyteDB(t, conn, "YugabyteDB does not support large objects")
-	
+
 	tx, err := conn.Begin(ctx)
 	if err != nil {
 		t.Fatal(err)

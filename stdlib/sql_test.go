@@ -5,6 +5,7 @@ import (
 	"context"
 	"database/sql"
 	"encoding/json"
+	"errors"
 	"fmt"
 	"math"
 	"os"
@@ -18,6 +19,7 @@ import (
 
 	"github.com/stretchr/testify/assert"
 	"github.com/stretchr/testify/require"
+
 	"github.com/yugabyte/pgx/v5"
 	"github.com/yugabyte/pgx/v5/pgconn"
 	"github.com/yugabyte/pgx/v5/pgtype"
@@ -26,10 +28,11 @@ import (
 	"github.com/yugabyte/pgx/v5/tracelog"
 )
 
-func openDB(t testing.TB) *sql.DB {
+func openDB(t testing.TB, opts ...stdlib.OptionOpenDB) *sql.DB {
+	t.Helper()
 	config, err := pgx.ParseConfig(os.Getenv("PGX_TEST_DATABASE"))
 	require.NoError(t, err)
-	return stdlib.OpenDB(*config)
+	return stdlib.OpenDB(*config, opts...)
 }
 
 func closeDB(t testing.TB, db *sql.DB) {
@@ -173,8 +176,6 @@ func TestSQLOpen(t *testing.T) {
 	}
 
 	for _, tt := range tests {
-		tt := tt
-
 		t.Run(tt.driverName, func(t *testing.T) {
 			db, err := sql.Open(tt.driverName, os.Getenv("PGX_TEST_DATABASE"))
 			require.NoError(t, err)
@@ -365,34 +366,30 @@ func TestConnConcurrency(t *testing.T) {
 		errChan := make(chan error, concurrency)
 
 		for i := 1; i <= concurrency; i++ {
-			wg.Add(1)
-
-			go func(idx int) {
-				defer wg.Done()
-
+			wg.Go(func() {
 				ctx, cancel := context.WithTimeout(context.Background(), 120*time.Second)
 				defer cancel()
 
-				str := strconv.Itoa(idx)
-				duration := time.Duration(idx) * time.Second
-				_, err := db.ExecContext(ctx, "insert into t values($1)", idx)
+				str := strconv.Itoa(i)
+				duration := time.Duration(i) * time.Second
+				_, err := db.ExecContext(ctx, "insert into t values($1)", i)
 				if err != nil {
-					errChan <- fmt.Errorf("insert failed: %d %w", idx, err)
+					errChan <- fmt.Errorf("insert failed: %d %w", i, err)
 					return
 				}
-				_, err = db.ExecContext(ctx, "update t set str = $1 where id = $2", str, idx)
+				_, err = db.ExecContext(ctx, "update t set str = $1 where id = $2", str, i)
 				if err != nil {
-					errChan <- fmt.Errorf("update 1 failed: %d %w", idx, err)
+					errChan <- fmt.Errorf("update 1 failed: %d %w", i, err)
 					return
 				}
-				_, err = db.ExecContext(ctx, "update t set dur_str = $1 where id = $2", duration, idx)
+				_, err = db.ExecContext(ctx, "update t set dur_str = $1 where id = $2", duration, i)
 				if err != nil {
-					errChan <- fmt.Errorf("update 2 failed: %d %w", idx, err)
+					errChan <- fmt.Errorf("update 2 failed: %d %w", i, err)
 					return
 				}
 
 				errChan <- nil
-			}(i)
+			})
 		}
 		wg.Wait()
 		for i := 1; i <= concurrency; i++ {
@@ -401,41 +398,37 @@ func TestConnConcurrency(t *testing.T) {
 		}
 
 		for i := 1; i <= concurrency; i++ {
-			wg.Add(1)
-
-			go func(idx int) {
-				defer wg.Done()
-
+			wg.Go(func() {
 				ctx, cancel := context.WithTimeout(context.Background(), 120*time.Second)
 				defer cancel()
 
 				var id int
 				var str string
 				var duration pgtype.Interval
-				err := db.QueryRowContext(ctx, "select id,str,dur_str from t where id = $1", idx).Scan(&id, &str, &duration)
+				err := db.QueryRowContext(ctx, "select id,str,dur_str from t where id = $1", i).Scan(&id, &str, &duration)
 				if err != nil {
-					errChan <- fmt.Errorf("select failed: %d %w", idx, err)
+					errChan <- fmt.Errorf("select failed: %d %w", i, err)
 					return
 				}
-				if id != idx {
-					errChan <- fmt.Errorf("id mismatch: %d %d", idx, id)
+				if id != i {
+					errChan <- fmt.Errorf("id mismatch: %d %d", i, id)
 					return
 				}
-				if str != strconv.Itoa(idx) {
-					errChan <- fmt.Errorf("str mismatch: %d %s", idx, str)
+				if str != strconv.Itoa(i) {
+					errChan <- fmt.Errorf("str mismatch: %d %s", i, str)
 					return
 				}
 				expectedDuration := pgtype.Interval{
-					Microseconds: int64(idx) * time.Second.Microseconds(),
+					Microseconds: int64(i) * time.Second.Microseconds(),
 					Valid:        true,
 				}
 				if duration != expectedDuration {
-					errChan <- fmt.Errorf("duration mismatch: %d %v", idx, duration)
+					errChan <- fmt.Errorf("duration mismatch: %d %v", i, duration)
 					return
 				}
 
 				errChan <- nil
-			}(i)
+			})
 		}
 		wg.Wait()
 		for i := 1; i <= concurrency; i++ {
@@ -501,7 +494,7 @@ func TestConnQueryFailure(t *testing.T) {
 	testWithAllQueryExecModes(t, func(t *testing.T, db *sql.DB) {
 		_, err := db.Query("select 'foo")
 		require.Error(t, err)
-		require.IsType(t, new(pgconn.PgError), err)
+		require.ErrorAs(t, err, new(*pgconn.PgError))
 	})
 }
 
@@ -560,7 +553,8 @@ func TestConnQueryScanRange(t *testing.T) {
 				UpperType: pgtype.Exclusive,
 				Valid:     true,
 			},
-			r)
+			r,
+		)
 	})
 }
 
@@ -764,7 +758,9 @@ func TestConnBeginTxReadOnly(t *testing.T) {
 
 func TestBeginTxContextCancel(t *testing.T) {
 	testWithAllQueryExecModes(t, func(t *testing.T, db *sql.DB) {
+		skipCockroachDB(t, db, "CockroachDB auto commits DDL by default")
 		skipYugabyteDB(t, db, "Error behavior differs on YugabyteDB")
+
 		_, err := db.Exec("drop table if exists t")
 		require.NoError(t, err)
 
@@ -785,7 +781,8 @@ func TestBeginTxContextCancel(t *testing.T) {
 
 		var n int
 		err = db.QueryRow("select count(*) from t").Scan(&n)
-		if pgErr, ok := err.(*pgconn.PgError); !ok || pgErr.Code != "42P01" {
+		var pgErr *pgconn.PgError
+		if !errors.As(err, &pgErr) || pgErr.Code != "42P01" {
 			t.Fatalf(`err => %v, want PgError{Code: "42P01"}`, err)
 		}
 	})
@@ -991,7 +988,7 @@ func TestRowsColumnTypes(t *testing.T) {
 					Scale:     0,
 					OK:        false,
 				},
-				ScanType: reflect.TypeOf(int64(0)),
+				ScanType: reflect.TypeFor[int64](),
 			}, {
 				Name:     "bar",
 				TypeName: "TEXT",
@@ -1011,7 +1008,7 @@ func TestRowsColumnTypes(t *testing.T) {
 					Scale:     0,
 					OK:        false,
 				},
-				ScanType: reflect.TypeOf(""),
+				ScanType: reflect.TypeFor[string](),
 			}, {
 				Name:     "dec",
 				TypeName: "NUMERIC",
@@ -1031,7 +1028,7 @@ func TestRowsColumnTypes(t *testing.T) {
 					Scale:     2,
 					OK:        true,
 				},
-				ScanType: reflect.TypeOf(float64(0)),
+				ScanType: reflect.TypeFor[float64](),
 			}, {
 				Name:     "d",
 				TypeName: "1266",
@@ -1051,7 +1048,7 @@ func TestRowsColumnTypes(t *testing.T) {
 					Scale:     0,
 					OK:        false,
 				},
-				ScanType: reflect.TypeOf(""),
+				ScanType: reflect.TypeFor[string](),
 			},
 		}
 
@@ -1216,7 +1213,7 @@ func TestConnQueryRowConstraintErrors(t *testing.T) {
 		_, err = db.Exec(`create function test_trigger() returns trigger language plpgsql as $$
 		begin
 		if new.n = 4 then
-			raise exception 'n cant be 4!';
+			raise exception 'n can''t be 4!';
 		end if;
 		return new;
 	end$$`)
@@ -1285,7 +1282,7 @@ func TestRandomizeHostOrderFunc(t *testing.T) {
 	}
 
 	// If we don't succeed within this many iterations, something is certainly wrong
-	for i := 0; i < 100000; i++ {
+	for range 100_000 {
 		connCopy := *config
 		stdlib.RandomizeHostOrderFunc(context.Background(), &connCopy)
 
@@ -1347,7 +1344,7 @@ func TestCheckIdleConn(t *testing.T) {
 	defer closeDB(t, db)
 
 	var conns []*sql.Conn
-	for i := 0; i < 3; i++ {
+	for range 3 {
 		c, err := db.Conn(context.Background())
 		require.NoError(t, err)
 		conns = append(conns, c)
@@ -1356,9 +1353,12 @@ func TestCheckIdleConn(t *testing.T) {
 	require.EqualValues(t, 3, db.Stats().OpenConnections)
 
 	var pids []uint32
+	var originalConns []*pgx.Conn
 	for _, c := range conns {
 		err := c.Raw(func(driverConn any) error {
-			pids = append(pids, driverConn.(*stdlib.Conn).Conn().PgConn().PID())
+			pgxConn := driverConn.(*stdlib.Conn).Conn()
+			pids = append(pids, pgxConn.PgConn().PID())
+			originalConns = append(originalConns, pgxConn)
 			return nil
 		})
 		require.NoError(t, err)
@@ -1387,14 +1387,138 @@ func TestCheckIdleConn(t *testing.T) {
 	c, err := db.Conn(context.Background())
 	require.NoError(t, err)
 
-	var cPID uint32
+	var newConn *pgx.Conn
 	err = c.Raw(func(driverConn any) error {
-		cPID = driverConn.(*stdlib.Conn).Conn().PgConn().PID()
+		newConn = driverConn.(*stdlib.Conn).Conn()
 		return nil
 	})
 	require.NoError(t, err)
 	err = c.Close()
 	require.NoError(t, err)
 
-	require.NotContains(t, pids, cPID)
+	// Compare connections by identity instead of by backend PID. PostgreSQL can assign a terminated backend's PID to a
+	// new backend, which made the equivalent pgxpool test flaky in CI.
+	for _, originalConn := range originalConns {
+		require.NotSame(t, originalConn, newConn)
+	}
+}
+
+func TestOptionShouldPing_HookCalledOnReuse(t *testing.T) {
+	hookCalled := false
+
+	db := openDB(t,
+		stdlib.OptionShouldPing(func(context.Context, stdlib.ShouldPingParams) bool {
+			hookCalled = true
+			// Return false to avoid relying on actual ping behavior.
+			return false
+		}),
+	)
+	defer closeDB(t, db)
+
+	// Ensure reuse (so ResetSession runs)
+	db.SetMaxOpenConns(1)
+	db.SetMaxIdleConns(1)
+
+	// Establish the connection
+	require.NoError(t, db.Ping())
+
+	// Reuse the connection -> should trigger ResetSession -> ShouldPing
+	_, err := db.Exec("select 1")
+	require.NoError(t, err)
+
+	require.True(t, hookCalled, "hook should be called on reuse")
+}
+
+// https://github.com/jackc/pgx/pull/2481
+func TestOpenTransactionsDiscarded(t *testing.T) {
+	db := openDB(t)
+	defer closeDB(t, db)
+
+	skipCockroachDB(t, db, "CockroachDB auto commits DDL by default")
+
+	db.SetMaxOpenConns(1)
+	ctx := context.Background()
+
+	for range 3 {
+		func() {
+			conn, err := db.Conn(ctx)
+			require.NoError(t, err)
+			defer conn.Close()
+
+			_, err = conn.ExecContext(ctx, "begin;")
+			require.NoError(t, err)
+
+			// If the open transaction is not discarded, the second time this is run it will fail.
+			_, err = conn.ExecContext(ctx, "create temporary table in_tx_discard_test(id int);")
+			require.NoError(t, err)
+		}()
+	}
+
+	ensureDBValid(t, db)
+}
+
+func TestRowsColumnTypeLength(t *testing.T) {
+	testWithAllQueryExecModes(t, func(t *testing.T, db *sql.DB) {
+		skipCockroachDB(t, db, "Server does not support type")
+
+		columnTypeLengthTests := []struct {
+			Len int64
+			OK  bool
+		}{
+			{
+				math.MaxInt64,
+				true,
+			},
+			{
+				math.MaxInt64,
+				true,
+			},
+			{
+				255,
+				true,
+			},
+			{
+				10,
+				true,
+			},
+			{
+				50,
+				true,
+			},
+			{
+				0,
+				false,
+			},
+		}
+
+		_, err := db.Exec(`CREATE TEMPORARY TABLE temp_column_type_length (
+						   text_column TEXT,
+						   bytea_column BYTEA,
+						   varchar_column VARCHAR(255),
+						   bpchar_column BPCHAR(10),
+						   varbit_column VARBIT(50),
+						   int_column INT
+					);`)
+		require.NoError(t, err)
+
+		rows, err := db.Query("SELECT * FROM temp_column_type_length")
+		require.NoError(t, err)
+
+		columns, err := rows.ColumnTypes()
+		require.NoError(t, err)
+		assert.Len(t, columns, 6)
+
+		for i, tt := range columnTypeLengthTests {
+			c := columns[i]
+
+			l, ok := c.Length()
+			if l != tt.Len {
+				t.Errorf("(%d) got: %d, want: %d", i, l, tt.Len)
+			}
+			if ok != tt.OK {
+				t.Errorf("(%d) got: %t, want: %t", i, ok, tt.OK)
+			}
+
+		}
+	})
 }

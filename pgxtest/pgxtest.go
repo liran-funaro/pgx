@@ -7,8 +7,8 @@ import (
 	"reflect"
 	"regexp"
 	"strconv"
-	"testing"
 	"strings"
+	"testing"
 
 	"github.com/yugabyte/pgx/v5"
 )
@@ -136,7 +136,7 @@ func RunValueRoundTripTests(
 				}
 
 				result := reflect.ValueOf(tt.Result)
-				if result.Kind() == reflect.Ptr {
+				if result.Kind() == reflect.Pointer {
 					result = result.Elem()
 				}
 
@@ -177,5 +177,23 @@ func SkipPostgreSQLVersionLessThan(t testing.TB, conn *pgx.Conn, minVersion int6
 
 	if serverVersion < minVersion {
 		t.Skipf("Test requires PostgreSQL v%d+", minVersion)
+	}
+}
+
+func SkipPostgreSQLVersionGreaterThan(t testing.TB, conn *pgx.Conn, maxVersion int64) {
+	serverVersionStr := conn.PgConn().ParameterStatus("server_version")
+	serverVersionStr = regexp.MustCompile(`^[0-9]+`).FindString(serverVersionStr)
+	// if not PostgreSQL do nothing
+	if serverVersionStr == "" {
+		return
+	}
+
+	serverVersion, err := strconv.ParseInt(serverVersionStr, 10, 64)
+	if err != nil {
+		t.Fatalf("postgres version parsed failed: %s", err)
+	}
+
+	if serverVersion > maxVersion {
+		t.Skipf("Test requires PostgreSQL v%d or lower", maxVersion)
 	}
 }

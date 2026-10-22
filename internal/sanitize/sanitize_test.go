@@ -2,6 +2,7 @@ package sanitize_test
 
 import (
 	"encoding/hex"
+	"math"
 	"strings"
 	"testing"
 	"time"
@@ -100,6 +101,54 @@ func TestNewQuery(t *testing.T) {
 			sql:      "select 'hello world",
 			expected: sanitize.Query{Parts: []sanitize.Part{"select 'hello world"}},
 		},
+		{
+			// Dollar-quoted string (anonymous) must not be treated as placeholders.
+			sql:      "select $$hello $1 world$$, $1",
+			expected: sanitize.Query{Parts: []sanitize.Part{"select $$hello $1 world$$, ", 1}},
+		},
+		{
+			// Dollar-quoted string with tag.
+			sql:      "select $tag$hello $1 world$tag$, $2",
+			expected: sanitize.Query{Parts: []sanitize.Part{"select $tag$hello $1 world$tag$, ", 2}},
+		},
+		{
+			// Dollar-quoted string with tag containing digits.
+			sql:      "select $t1$body$2$t1$, $3",
+			expected: sanitize.Query{Parts: []sanitize.Part{"select $t1$body$2$t1$, ", 3}},
+		},
+		{
+			// Dollar-quoted string may contain nested $$ sequences that don't match the outer tag.
+			sql:      "select $outer$ $$ still inside $1 $$ $outer$, $1",
+			expected: sanitize.Query{Parts: []sanitize.Part{"select $outer$ $$ still inside $1 $$ $outer$, ", 1}},
+		},
+		{
+			// Unterminated dollar-quoted string: consume the rest of input.
+			sql:      "select $$hello $1 world",
+			expected: sanitize.Query{Parts: []sanitize.Part{"select $$hello $1 world"}},
+		},
+		{
+			// $digit is still a placeholder, not a dollar-quote open.
+			sql:      "select $1 $2",
+			expected: sanitize.Query{Parts: []sanitize.Part{"select ", 1, " ", 2}},
+		},
+		{
+			// Dollar sign not followed by identifier/$/digit is literal.
+			sql:      "select $ + $1",
+			expected: sanitize.Query{Parts: []sanitize.Part{"select $ + ", 1}},
+		},
+		{
+			// Dollar followed by a non-tag identifier that never meets a closing $ is not a dollar-quoted string.
+			sql:      "select $abc + $1",
+			expected: sanitize.Query{Parts: []sanitize.Part{"select $abc + ", 1}},
+		},
+		{
+			// Overflow-sized placeholder number must not wrap: it should be
+			// preserved as some value that Sanitize will reject with
+			// "insufficient arguments" rather than silently wrapping to a
+			// small/negative index that aliases a real argument.
+			sql:      "select $92233720368547758070",
+			expected: sanitize.Query{Parts: []sanitize.Part{"select ", math.MaxInt32}},
+		},
 	}
 
 	for i, tt := range successTests {
@@ -177,6 +226,27 @@ func TestQuerySanitize(t *testing.T) {
 			expected: `insert  '2020-03-01 23:59:59.999999Z' `,
 		},
 		{
+			// A BC year gets PostgreSQL's era suffix, which comes after the zone.
+			// time.Format writes a leading minus instead, which PostgreSQL rejects
+			// outright.
+			query:    sanitize.Query{Parts: []sanitize.Part{"insert ", 1}},
+			args:     []any{time.Date(-4712, time.February, 29, 0, 0, 0, 0, time.UTC)},
+			expected: `insert  '4713-02-29 00:00:00Z BC' `,
+		},
+		{
+			// A year past four digits is written out in full rather than truncated.
+			query:    sanitize.Query{Parts: []sanitize.Part{"insert ", 1}},
+			args:     []any{time.Date(10000, time.January, 2, 3, 4, 5, 0, time.UTC)},
+			expected: `insert  '10000-01-02 03:04:05Z' `,
+		},
+		{
+			// A value in another zone is converted to UTC, matching what pgtype's
+			// timestamptz text encoder sends.
+			query:    sanitize.Query{Parts: []sanitize.Part{"insert ", 1}},
+			args:     []any{time.Date(2020, time.March, 1, 23, 59, 59, 999999999, time.FixedZone("", 5*60*60))},
+			expected: `insert  '2020-03-01 18:59:59.999999Z' `,
+		},
+		{
 			query:    sanitize.Query{Parts: []sanitize.Part{"select 1-", 1}},
 			args:     []any{int64(-1)},
 			expected: `select 1- -1 `,
@@ -219,6 +289,13 @@ func TestQuerySanitize(t *testing.T) {
 			query:    sanitize.Query{Parts: []sanitize.Part{"select ", 1}},
 			args:     []any{42},
 			expected: `invalid arg type: int`,
+		},
+		{
+			// An overflow-clamped placeholder must not silently map onto a
+			// real argument; it must produce an error.
+			query:    sanitize.Query{Parts: []sanitize.Part{"select ", math.MaxInt32}},
+			args:     []any{int64(42)},
+			expected: `insufficient arguments`,
 		},
 	}
 

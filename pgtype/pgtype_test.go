@@ -178,6 +178,21 @@ func TestMapScanBinaryFormatInterfacePtr(t *testing.T) {
 	assert.Equal(t, "foo", got)
 }
 
+func TestMapScanUnknownOIDToPtrToAny(t *testing.T) {
+	unknownOID := uint32(999999)
+	srcBuf := []byte("foo")
+	m := pgtype.NewMap()
+
+	var a any
+	err := m.Scan(unknownOID, pgx.TextFormatCode, srcBuf, &a)
+	assert.NoError(t, err)
+	assert.Equal(t, "foo", a)
+
+	err = m.Scan(unknownOID, pgx.BinaryFormatCode, srcBuf, &a)
+	assert.NoError(t, err)
+	assert.Equal(t, []byte("foo"), a)
+}
+
 func TestMapScanUnknownOIDToStringsAndBytes(t *testing.T) {
 	unknownOID := uint32(999999)
 	srcBuf := []byte("foo")
@@ -251,7 +266,7 @@ func TestMapScanUnregisteredOIDIntoRenamedStringSQLScanner(t *testing.T) {
 
 type pgCustomInt int64
 
-func (ci *pgCustomInt) Scan(src interface{}) error {
+func (ci *pgCustomInt) Scan(src any) error {
 	*ci = pgCustomInt(src.(int64))
 	return nil
 }
@@ -294,7 +309,7 @@ func TestScanPlanBinaryInt32ScanScanner(t *testing.T) {
 func TestScanPlanInterface(t *testing.T) {
 	m := pgtype.NewMap()
 	src := []byte{0, 42}
-	var v interface{}
+	var v any
 	plan := m.PlanScan(pgtype.Int2OID, pgtype.BinaryFormatCode, v)
 	err := plan.Scan(src, v)
 	assert.Error(t, err)
@@ -326,6 +341,89 @@ func TestPointerPointerStructScan(t *testing.T) {
 	err := plan.Scan([]byte("(1)"), &c)
 	require.NoError(t, err)
 	require.Equal(t, 1, c.ID)
+}
+
+func TestPointerDoublePointerStructScan(t *testing.T) {
+	m := pgtype.NewMap()
+	type composite struct {
+		ID **int
+	}
+
+	int4Type, _ := m.TypeForOID(pgtype.Int4OID)
+	pgt := &pgtype.Type{
+		Codec: &pgtype.CompositeCodec{
+			Fields: []pgtype.CompositeCodecField{
+				{
+					Name: "id",
+					Type: int4Type,
+				},
+			},
+		},
+		Name: "composite",
+		OID:  215333,
+	}
+	m.RegisterType(pgt)
+
+	var c *composite
+	plan := m.PlanScan(pgt.OID, pgtype.TextFormatCode, &c)
+	err := plan.Scan([]byte("(1)"), &c)
+	require.NoError(t, err)
+	require.Equal(t, 1, **c.ID)
+}
+
+func TestPointerDoublePointerStructScannerScan(t *testing.T) {
+	m := pgtype.NewMap()
+	type composite struct {
+		ID **sql.NullInt64
+	}
+
+	int4Type, _ := m.TypeForOID(pgtype.Int4OID)
+	pgt := &pgtype.Type{
+		Codec: &pgtype.CompositeCodec{
+			Fields: []pgtype.CompositeCodecField{
+				{
+					Name: "id",
+					Type: int4Type,
+				},
+			},
+		},
+		Name: "composite",
+		OID:  215333,
+	}
+	m.RegisterType(pgt)
+
+	var c *composite
+	plan := m.PlanScan(pgt.OID, pgtype.TextFormatCode, &c)
+	err := plan.Scan([]byte("(1)"), &c)
+	require.NoError(t, err)
+	require.Equal(t, sql.NullInt64{
+		Int64: 1,
+		Valid: true,
+	}, **c.ID)
+}
+
+func TestPointerPointerScanNilDestination(t *testing.T) {
+	m := pgtype.NewMap()
+
+	var nilDst **string
+	err := m.Scan(pgtype.TextOID, pgtype.TextFormatCode, []byte("hello"), nilDst)
+	require.Error(t, err)
+
+	err = m.Scan(pgtype.TextOID, pgtype.TextFormatCode, nil, nilDst)
+	require.Error(t, err)
+
+	// A plan built for a non-nil destination may be reused for a nil destination of the same type. e.g. Rows.Scan
+	// caches scan plans by reflect.Type.
+	s := "hello"
+	ps := &s
+	plan := m.PlanScan(pgtype.TextOID, pgtype.TextFormatCode, &ps)
+	require.NoError(t, plan.Scan([]byte("hello"), &ps))
+	require.Error(t, plan.Scan([]byte("hello"), nilDst))
+}
+
+func TestTryPointerPointerScanPlanNil(t *testing.T) {
+	_, _, ok := pgtype.TryPointerPointerScanPlan(nil)
+	require.False(t, ok)
 }
 
 // https://github.com/jackc/pgx/issues/1263
@@ -591,7 +689,7 @@ func BenchmarkMapScanInt4IntoBinaryDecoder(b *testing.B) {
 	src := []byte{0, 0, 0, 42}
 	var v pgtype.Int4
 
-	for i := 0; i < b.N; i++ {
+	for b.Loop() {
 		v = pgtype.Int4{}
 		err := m.Scan(pgtype.Int4OID, pgtype.BinaryFormatCode, src, &v)
 		if err != nil {
@@ -608,7 +706,7 @@ func BenchmarkMapScanInt4IntoGoInt32(b *testing.B) {
 	src := []byte{0, 0, 0, 42}
 	var v int32
 
-	for i := 0; i < b.N; i++ {
+	for b.Loop() {
 		v = 0
 		err := m.Scan(pgtype.Int4OID, pgtype.BinaryFormatCode, src, &v)
 		if err != nil {
@@ -627,7 +725,7 @@ func BenchmarkScanPlanScanInt4IntoBinaryDecoder(b *testing.B) {
 
 	plan := m.PlanScan(pgtype.Int4OID, pgtype.BinaryFormatCode, &v)
 
-	for i := 0; i < b.N; i++ {
+	for b.Loop() {
 		v = pgtype.Int4{}
 		err := plan.Scan(src, &v)
 		if err != nil {
@@ -646,7 +744,7 @@ func BenchmarkScanPlanScanInt4IntoGoInt32(b *testing.B) {
 
 	plan := m.PlanScan(pgtype.Int4OID, pgtype.BinaryFormatCode, &v)
 
-	for i := 0; i < b.N; i++ {
+	for b.Loop() {
 		v = 0
 		err := plan.Scan(src, &v)
 		if err != nil {

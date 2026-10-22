@@ -4,6 +4,7 @@ import (
 	"context"
 	"errors"
 	"fmt"
+	"math"
 	"os"
 	"sync/atomic"
 	"testing"
@@ -43,13 +44,28 @@ func TestConnectConfig(t *testing.T) {
 func TestParseConfigExtractsPoolArguments(t *testing.T) {
 	t.Parallel()
 
-	config, err := pgxpool.ParseConfig("pool_max_conns=42 pool_min_conns=1 pool_min_idle_conns=2")
+	config, err := pgxpool.ParseConfig("pool_max_conns=42 pool_min_conns=1 pool_min_idle_conns=2 pool_ping_timeout=250ms")
 	assert.NoError(t, err)
 	assert.EqualValues(t, 42, config.MaxConns)
 	assert.EqualValues(t, 1, config.MinConns)
 	assert.EqualValues(t, 2, config.MinIdleConns)
+	assert.Equal(t, 250*time.Millisecond, config.PingTimeout)
+
+	// Anything left in RuntimeParams is sent to the server as a startup parameter, which makes every connection fail
+	// with "unrecognized configuration parameter".
 	assert.NotContains(t, config.ConnConfig.Config.RuntimeParams, "pool_max_conns")
 	assert.NotContains(t, config.ConnConfig.Config.RuntimeParams, "pool_min_conns")
+	assert.NotContains(t, config.ConnConfig.Config.RuntimeParams, "pool_min_idle_conns")
+	assert.NotContains(t, config.ConnConfig.Config.RuntimeParams, "pool_ping_timeout")
+
+	config, err = pgxpool.ParseConfig("")
+	assert.NoError(t, err)
+	assert.Zero(t, config.PingTimeout)
+
+	for _, v := range []string{"abc", "250"} {
+		_, err := pgxpool.ParseConfig("pool_ping_timeout=" + v)
+		assert.Errorf(t, err, "pool_ping_timeout=%s should be rejected", v)
+	}
 }
 
 func TestConstructorIgnoresContext(t *testing.T) {
@@ -167,7 +183,7 @@ func TestPoolAcquireChecksIdleConns(t *testing.T) {
 	defer pool.Close()
 
 	var conns []*pgxpool.Conn
-	for i := 0; i < 3; i++ {
+	for range 3 {
 		c, err := pool.Acquire(ctx)
 		require.NoError(t, err)
 		conns = append(conns, c)
@@ -176,8 +192,10 @@ func TestPoolAcquireChecksIdleConns(t *testing.T) {
 	require.EqualValues(t, 3, pool.Stat().TotalConns())
 
 	var pids []uint32
+	var originalConns []*pgx.Conn
 	for _, c := range conns {
 		pids = append(pids, c.Conn().PgConn().PID())
+		originalConns = append(originalConns, c.Conn())
 		c.Release()
 	}
 
@@ -199,10 +217,14 @@ func TestPoolAcquireChecksIdleConns(t *testing.T) {
 	c, err := pool.Acquire(ctx)
 	require.NoError(t, err)
 
-	cPID := c.Conn().PgConn().PID()
+	newConn := c.Conn()
 	c.Release()
 
-	require.NotContains(t, pids, cPID)
+	// Compare connections by identity instead of by backend PID. PostgreSQL can assign a terminated backend's PID to a
+	// new backend, which made this test flaky in CI.
+	for _, originalConn := range originalConns {
+		require.NotSame(t, originalConn, newConn)
+	}
 }
 
 func TestPoolAcquireChecksIdleConnsWithShouldPing(t *testing.T) {
@@ -231,6 +253,8 @@ func TestPoolAcquireChecksIdleConnsWithShouldPing(t *testing.T) {
 	require.NoError(t, err)
 	defer pool.Close()
 
+	const idleTime = 200 * time.Millisecond
+
 	c, err := pool.Acquire(ctx)
 	require.NoError(t, err)
 
@@ -252,7 +276,7 @@ func TestPoolAcquireChecksIdleConnsWithShouldPing(t *testing.T) {
 	_ = c.Conn().PgConn().PID()
 	c.Release()
 
-	time.Sleep(time.Millisecond * 200)
+	time.Sleep(idleTime)
 
 	c, err = pool.Acquire(ctx)
 	require.NoError(t, err)
@@ -260,8 +284,31 @@ func TestPoolAcquireChecksIdleConnsWithShouldPing(t *testing.T) {
 
 	require.NotNil(t, shouldPingLastCalledWith)
 	assert.Equal(t, conn, shouldPingLastCalledWith.Conn)
-	assert.InDelta(t, time.Millisecond*200, shouldPingLastCalledWith.IdleDuration, float64(time.Millisecond*100))
+	// Only the lower bound can be asserted. A busy machine can delay the acquire arbitrarily long after the sleep,
+	// which made an upper bound assertion flaky in CI.
+	assert.GreaterOrEqual(t, shouldPingLastCalledWith.IdleDuration, idleTime)
 
+	c.Release()
+}
+
+// https://github.com/jackc/pgx/issues/2379
+func TestPoolAcquireWithMaxConnsEqualsMaxInt32(t *testing.T) {
+	t.Parallel()
+
+	ctx, cancel := context.WithTimeout(context.Background(), 120*time.Second)
+	defer cancel()
+
+	config, err := pgxpool.ParseConfig(os.Getenv("PGX_TEST_DATABASE"))
+	require.NoError(t, err)
+
+	config.MaxConns = math.MaxInt32
+
+	pool, err := pgxpool.NewWithConfig(ctx, config)
+	require.NoError(t, err)
+	defer pool.Close()
+
+	c, err := pool.Acquire(ctx)
+	require.NoError(t, err)
 	c.Release()
 }
 
@@ -475,17 +522,20 @@ func TestPoolAfterRelease(t *testing.T) {
 	require.NoError(t, err)
 	defer db.Close()
 
-	connPIDs := map[uint32]struct{}{}
+	// Count distinct connections by identity instead of by backend PID. PostgreSQL can assign a terminated backend's
+	// PID to a new backend, which made this test flaky in CI. Retaining the connections in the map also prevents them
+	// from being garbage collected, so a destroyed connection's address cannot be reused either.
+	distinctConns := map[*pgx.Conn]struct{}{}
 
-	for i := 0; i < 10; i++ {
+	for range 10 {
 		conn, err := db.Acquire(ctx)
 		assert.NoError(t, err)
-		connPIDs[conn.Conn().PgConn().PID()] = struct{}{}
+		distinctConns[conn.Conn()] = struct{}{}
 		conn.Release()
 		waitForReleaseToComplete()
 	}
 
-	assert.EqualValues(t, 5, len(connPIDs))
+	assert.EqualValues(t, 5, len(distinctConns))
 }
 
 func TestPoolBeforeClose(t *testing.T) {
@@ -514,7 +564,7 @@ func TestPoolBeforeClose(t *testing.T) {
 
 	acquiredPIDs := make([]uint32, 0, 5)
 	closedPIDs := make([]uint32, 0, 5)
-	for i := 0; i < 5; i++ {
+	for range 5 {
 		conn, err := db.Acquire(ctx)
 		assert.NoError(t, err)
 		acquiredPIDs = append(acquiredPIDs, conn.Conn().PgConn().PID())
@@ -632,7 +682,7 @@ func TestConnReleaseClosesBusyConn(t *testing.T) {
 	waitForReleaseToComplete()
 
 	// wait for the connection to actually be destroyed
-	for i := 0; i < 1000; i++ {
+	for range 1000 {
 		if db.Stat().TotalConns() == 0 {
 			break
 		}
@@ -693,7 +743,7 @@ func TestPoolBackgroundChecksMaxConnIdleTime(t *testing.T) {
 	c.Release()
 	time.Sleep(config.HealthCheckPeriod)
 
-	for i := 0; i < 1000; i++ {
+	for range 1000 {
 		if db.Stat().TotalConns() == 0 {
 			break
 		}
@@ -1014,7 +1064,7 @@ func TestConnReleaseDestroysClosedConn(t *testing.T) {
 	waitForReleaseToComplete()
 
 	// wait for the connection to actually be destroyed
-	for i := 0; i < 1000; i++ {
+	for range 1000 {
 		if pool.Stat().TotalConns() == 0 {
 			break
 		}
@@ -1037,7 +1087,7 @@ func TestConnPoolQueryConcurrentLoad(t *testing.T) {
 	n := 100
 	done := make(chan bool)
 
-	for i := 0; i < n; i++ {
+	for range n {
 		go func() {
 			defer func() { done <- true }()
 			testQuery(t, ctx, pool)
@@ -1045,7 +1095,7 @@ func TestConnPoolQueryConcurrentLoad(t *testing.T) {
 		}()
 	}
 
-	for i := 0; i < n; i++ {
+	for range n {
 		<-done
 	}
 }
@@ -1063,20 +1113,43 @@ func TestConnReleaseWhenBeginFail(t *testing.T) {
 	tx, err := db.BeginTx(ctx, pgx.TxOptions{
 		IsoLevel: pgx.TxIsoLevel("foo"),
 	})
-	assert.Error(t, err)
-	if !assert.Zero(t, tx) {
-		err := tx.Rollback(ctx)
-		assert.NoError(t, err)
-	}
+	require.Error(t, err)
+	require.Zero(t, tx)
 
-	for i := 0; i < 1000; i++ {
+	require.EqualValues(t, 1, db.Stat().TotalConns())
+
+	var n int
+	require.NoError(t, db.QueryRow(ctx, "select 1").Scan(&n))
+	require.EqualValues(t, 1, n)
+}
+
+func TestConnDestroyedWhenBeginFailsFatally(t *testing.T) {
+	t.Parallel()
+
+	ctx, cancel := context.WithTimeout(context.Background(), 120*time.Second)
+	defer cancel()
+
+	controllerConn, err := pgx.Connect(ctx, os.Getenv("PGX_TEST_DATABASE"))
+	require.NoError(t, err)
+	defer controllerConn.Close(ctx)
+	pgxtest.SkipCockroachDB(t, controllerConn, "Server does not support pg_terminate_backend() (https://github.com/cockroachdb/cockroach/issues/35897)")
+
+	db, err := pgxpool.New(ctx, os.Getenv("PGX_TEST_DATABASE"))
+	require.NoError(t, err)
+	defer db.Close()
+
+	tx, err := db.BeginTx(ctx, pgx.TxOptions{BeginQuery: "select pg_terminate_backend(pg_backend_pid())"})
+	require.Error(t, err)
+	require.Zero(t, tx)
+
+	for range 1000 {
 		if db.Stat().TotalConns() == 0 {
 			break
 		}
 		time.Sleep(time.Millisecond)
 	}
 
-	assert.EqualValues(t, 0, db.Stat().TotalConns())
+	require.EqualValues(t, 0, db.Stat().TotalConns())
 }
 
 func TestTxBeginFuncNestedTransactionCommit(t *testing.T) {
@@ -1202,15 +1275,15 @@ func TestConnectEagerlyReachesMinPoolSize(t *testing.T) {
 	config.MinConns = int32(12)
 	config.MaxConns = int32(15)
 
-	acquireAttempts := int64(0)
-	connectAttempts := int64(0)
+	var acquireAttempts atomic.Int64
+	var connectAttempts atomic.Int64
 
 	config.PrepareConn = func(ctx context.Context, conn *pgx.Conn) (bool, error) {
-		atomic.AddInt64(&acquireAttempts, 1)
+		acquireAttempts.Add(1)
 		return true, nil
 	}
 	config.BeforeConnect = func(ctx context.Context, cfg *pgx.ConnConfig) error {
-		atomic.AddInt64(&connectAttempts, 1)
+		connectAttempts.Add(1)
 		return nil
 	}
 
@@ -1218,11 +1291,11 @@ func TestConnectEagerlyReachesMinPoolSize(t *testing.T) {
 	require.NoError(t, err)
 	defer pool.Close()
 
-	for i := 0; i < 500; i++ {
+	for range 500 {
 		time.Sleep(10 * time.Millisecond)
 
 		stat := pool.Stat()
-		if stat.IdleConns() == 12 && stat.AcquireCount() == 0 && stat.TotalConns() == 12 && atomic.LoadInt64(&acquireAttempts) == 0 && atomic.LoadInt64(&connectAttempts) == 12 {
+		if stat.IdleConns() == 12 && stat.AcquireCount() == 0 && stat.TotalConns() == 12 && acquireAttempts.Load() == 0 && connectAttempts.Load() == 12 {
 			return
 		}
 	}
@@ -1243,7 +1316,7 @@ func TestPoolSendBatchBatchCloseTwice(t *testing.T) {
 	errChan := make(chan error)
 	testCount := 5000
 
-	for i := 0; i < testCount; i++ {
+	for range testCount {
 		go func() {
 			batch := &pgx.Batch{}
 			batch.Queue("select 1")
@@ -1279,8 +1352,143 @@ func TestPoolSendBatchBatchCloseTwice(t *testing.T) {
 		}()
 	}
 
-	for i := 0; i < testCount; i++ {
+	for range testCount {
 		err := <-errChan
 		assert.NoError(t, err)
 	}
+}
+
+func TestPoolAcquireDestroysExpiredIdleConn(t *testing.T) {
+	t.Parallel()
+
+	ctx, cancel := context.WithTimeout(context.Background(), 120*time.Second)
+	defer cancel()
+
+	config, err := pgxpool.ParseConfig(os.Getenv("PGX_TEST_DATABASE"))
+	require.NoError(t, err)
+
+	config.MaxConnLifetime = 250 * time.Millisecond
+	config.HealthCheckPeriod = 10 * time.Second
+
+	pool, err := pgxpool.NewWithConfig(ctx, config)
+	require.NoError(t, err)
+	defer pool.Close()
+
+	// Acquire and release before expiry so the connection goes idle while still valid.
+	c, err := pool.Acquire(ctx)
+	require.NoError(t, err)
+	c.Release()
+	waitForReleaseToComplete()
+
+	require.EqualValues(t, 1, pool.Stat().TotalConns())
+	require.EqualValues(t, 0, pool.Stat().MaxLifetimeDestroyCount())
+
+	// Wait for the idle connection to expire.
+	time.Sleep(config.MaxConnLifetime + 100*time.Millisecond)
+
+	// Acquire should pick up the expired idle conn, the new isExpired check in Acquire
+	// destroys it, and a fresh connection is created.
+	c, err = pool.Acquire(ctx)
+	require.NoError(t, err)
+	c.Release()
+
+	// Give destroy time to settle.
+	time.Sleep(500 * time.Millisecond)
+
+	stats := pool.Stat()
+	require.EqualValues(t, 1, stats.MaxLifetimeDestroyCount())
+	require.EqualValues(t, 1, stats.TotalConns())
+}
+
+func TestPoolAcquireUnlimitedLifetimeDoesNotExpire(t *testing.T) {
+	t.Parallel()
+
+	ctx, cancel := context.WithTimeout(context.Background(), 120*time.Second)
+	defer cancel()
+
+	config, err := pgxpool.ParseConfig(os.Getenv("PGX_TEST_DATABASE"))
+	require.NoError(t, err)
+
+	// A MaxConnLifetime of zero means connections never expire due to age. The
+	// acquire-time expiry check must not treat such connections as expired,
+	// otherwise Acquire destroys and recreates them in a loop and ultimately fails.
+	config.MaxConnLifetime = 0
+	config.HealthCheckPeriod = 100 * time.Millisecond
+
+	pool, err := pgxpool.NewWithConfig(ctx, config)
+	require.NoError(t, err)
+	defer pool.Close()
+
+	// Establish a single connection and remember its identity.
+	c, err := pool.Acquire(ctx)
+	require.NoError(t, err)
+	firstConn := c.Conn()
+	c.Release()
+	waitForReleaseToComplete()
+
+	require.EqualValues(t, 1, pool.Stat().TotalConns())
+
+	// Give the background health check several chances to (wrongly) reap the conn.
+	time.Sleep(500 * time.Millisecond)
+
+	// Re-acquiring must succeed and hand back the very same connection: it was
+	// neither expired at acquire time nor destroyed by the health check.
+	for range 5 {
+		c, err = pool.Acquire(ctx)
+		require.NoError(t, err)
+		require.Same(t, firstConn, c.Conn())
+		c.Release()
+		waitForReleaseToComplete()
+	}
+
+	stats := pool.Stat()
+	require.EqualValues(t, 0, stats.MaxLifetimeDestroyCount())
+	require.EqualValues(t, 1, stats.TotalConns())
+}
+
+func TestPoolAcquirePingTimeout(t *testing.T) {
+	t.Parallel()
+
+	ctx, cancel := context.WithTimeout(context.Background(), 120*time.Second)
+	defer cancel()
+
+	config, err := pgxpool.ParseConfig(os.Getenv("PGX_TEST_DATABASE"))
+	require.NoError(t, err)
+
+	config.PingTimeout = 200 * time.Millisecond
+	config.ConnConfig.DialFunc = newDelayProxyDialFunc(500 * time.Millisecond)
+
+	var originalConn *pgx.Conn
+	// Only ping the original connection to force creation of a new connection
+	config.ShouldPing = func(_ context.Context, params pgxpool.ShouldPingParams) bool {
+		return originalConn != nil && params.Conn == originalConn
+	}
+
+	// Limit to a single connection to ensure the same connection is reused
+	config.MinConns = 1
+	config.MaxConns = 1
+
+	pool, err := pgxpool.NewWithConfig(ctx, config)
+	require.NoError(t, err)
+	defer pool.Close()
+
+	c, err := pool.Acquire(ctx)
+	require.NoError(t, err)
+	require.EqualValues(t, 1, pool.Stat().TotalConns())
+	originalConn = c.Conn()
+
+	c.Release()
+	require.EqualValues(t, 1, pool.Stat().TotalConns())
+
+	c, err = pool.Acquire(ctx)
+	require.NoError(t, err)
+	require.EqualValues(t, 1, pool.Stat().TotalConns())
+	newConn := c.Conn()
+
+	c.Release()
+
+	require.EqualValues(t, 1, pool.Stat().TotalConns())
+	assert.Nil(t, ctx.Err())
+	assert.NotSame(t, originalConn, newConn,
+		"Expected new connection due to ping timeout, but got same connection")
 }

@@ -8,7 +8,6 @@ import (
 	"errors"
 	"fmt"
 	"io"
-	"log"
 	"math"
 	"net"
 	"os"
@@ -30,7 +29,11 @@ import (
 	"github.com/yugabyte/pgx/v5/pgtype"
 )
 
-const pgbouncerConnStringEnvVar = "PGX_TEST_PGBOUNCER_CONN_STRING"
+const (
+	pgbouncerConnStringEnvVar = "PGX_TEST_PGBOUNCER_CONN_STRING"
+	// runOAuthTestEnvVar has to be set to "true" to run OAuth tests
+	runOAuthTestEnvVar = "PGX_TEST_OAUTH"
+)
 
 func TestConnect(t *testing.T) {
 	tests := []struct {
@@ -45,7 +48,6 @@ func TestConnect(t *testing.T) {
 	}
 
 	for _, tt := range tests {
-		tt := tt
 		t.Run(tt.name, func(t *testing.T) {
 			ctx, cancel := context.WithTimeout(context.Background(), 120*time.Second)
 			defer cancel()
@@ -76,7 +78,6 @@ func TestConnectWithOptions(t *testing.T) {
 	}
 
 	for _, tt := range tests {
-		tt := tt
 		t.Run(tt.name, func(t *testing.T) {
 			ctx, cancel := context.WithTimeout(context.Background(), 120*time.Second)
 			defer cancel()
@@ -100,24 +101,248 @@ func TestConnectWithOptions(t *testing.T) {
 func TestConnectTLS(t *testing.T) {
 	t.Parallel()
 
-	ctx, cancel := context.WithTimeout(context.Background(), 120*time.Second)
-	defer cancel()
+	setup := func(t *testing.T, connString string) (*pgconn.PgConn, context.Context) {
+		t.Helper()
 
-	connString := os.Getenv("PGX_TEST_TLS_CONN_STRING")
-	if connString == "" {
-		t.Skipf("Skipping due to missing environment variable %v", "PGX_TEST_TLS_CONN_STRING")
+		ctx, cancel := context.WithTimeout(context.Background(), 120*time.Second)
+		t.Cleanup(cancel)
+
+		conn, err := pgconn.Connect(ctx, connString)
+		require.NoError(t, err)
+		t.Cleanup(func() { closeConn(t, conn) })
+
+		return conn, ctx
 	}
 
-	conn, err := pgconn.Connect(ctx, connString)
+	t.Run("WithChannelBinding", func(t *testing.T) {
+		t.Parallel()
+
+		connString := os.Getenv("PGX_TEST_SCRAM_PLUS_CONN_STRING")
+		if connString == "" {
+			t.Skipf("Skipping due to missing environment variable %v", "PGX_TEST_SCRAM_PLUS_CONN_STRING")
+		}
+
+		conn, ctx := setup(t, connString)
+
+		result := conn.ExecParams(ctx, `select ssl from pg_stat_ssl where pg_backend_pid() = pid;`, nil, nil, nil, nil).Read()
+		require.NoError(t, result.Err)
+		require.Len(t, result.Rows, 1)
+		require.Len(t, result.Rows[0], 1)
+		require.Equalf(t, "t", string(result.Rows[0][0]), "not a TLS connection")
+	})
+
+	t.Run("WithoutChannelBinding", func(t *testing.T) {
+		t.Parallel()
+
+		connString := os.Getenv("PGX_TEST_TLS_CONN_STRING")
+		if connString == "" {
+			t.Skipf("Skipping due to missing environment variable %v", "PGX_TEST_TLS_CONN_STRING")
+		}
+
+		conn, ctx := setup(t, connString)
+
+		result := conn.ExecParams(ctx, `select ssl from pg_stat_ssl where pg_backend_pid() = pid;`, nil, nil, nil, nil).Read()
+		require.NoError(t, result.Err)
+		require.Len(t, result.Rows, 1)
+		require.Len(t, result.Rows[0], 1)
+		require.Equalf(t, "t", string(result.Rows[0][0]), "not a TLS connection")
+	})
+}
+
+// A NUL byte reaching Config.RuntimeParams by a route that bypasses connection
+// string parsing (direct assignment here, a service file elsewhere) must still
+// not be sent: the startup message body is NUL-delimited, so the value below
+// would log the connection in as "admin". Connect must fail with nothing
+// written to the wire.
+func TestConnectRejectsNulByteInRuntimeParam(t *testing.T) {
+	t.Parallel()
+
+	ln, err := net.Listen("tcp", "127.0.0.1:")
+	require.NoError(t, err)
+	defer ln.Close()
+
+	serverBytesChan := make(chan []byte, 1)
+	go func() {
+		conn, err := ln.Accept()
+		if err != nil {
+			serverBytesChan <- nil
+			return
+		}
+		defer conn.Close()
+
+		conn.SetDeadline(time.Now().Add(time.Second * 5))
+		buf, _ := io.ReadAll(conn)
+		serverBytesChan <- buf
+	}()
+
+	host, port, _ := strings.Cut(ln.Addr().String(), ":")
+	config, err := pgconn.ParseConfig(fmt.Sprintf("sslmode=disable host=%s port=%s user=lowpriv", host, port))
+	require.NoError(t, err)
+	config.RuntimeParams["application_name"] = "x\x00user\x00admin"
+
+	ctx, cancel := context.WithTimeout(context.Background(), time.Second*5)
+	defer cancel()
+
+	_, err = pgconn.ConnectConfig(ctx, config)
+	require.ErrorContains(t, err, `startup message parameter "application_name" contains NUL byte in value`)
+
+	select {
+	case buf := <-serverBytesChan:
+		require.Empty(t, buf, "no bytes should reach the server")
+	case <-time.After(time.Second * 5):
+		t.Fatal("timed out waiting for server")
+	}
+}
+
+func TestConnectChannelBinding(t *testing.T) {
+	t.Parallel()
+
+	t.Run("RequireFailsWithoutTLS", func(t *testing.T) {
+		t.Parallel()
+
+		script := &pgmock.Script{
+			Steps: []pgmock.Step{
+				pgmock.ExpectAnyMessage(&pgproto3.StartupMessage{ProtocolVersion: pgproto3.ProtocolVersion30, Parameters: map[string]string{}}),
+				pgmock.SendMessage(&pgproto3.AuthenticationSASL{AuthMechanisms: []string{"SCRAM-SHA-256", "SCRAM-SHA-256-PLUS"}}),
+				pgmock.WaitForClose(),
+			},
+		}
+
+		ln, err := net.Listen("tcp", "127.0.0.1:")
+		require.NoError(t, err)
+		defer ln.Close()
+
+		serverErrChan := make(chan error, 1)
+		go func() {
+			defer close(serverErrChan)
+
+			conn, err := ln.Accept()
+			if err != nil {
+				serverErrChan <- err
+				return
+			}
+			defer conn.Close()
+
+			err = conn.SetDeadline(time.Now().Add(time.Second * 5))
+			if err != nil {
+				serverErrChan <- err
+				return
+			}
+
+			err = script.Run(pgproto3.NewBackend(conn, conn))
+			if err != nil {
+				serverErrChan <- err
+				return
+			}
+		}()
+
+		host, port, _ := strings.Cut(ln.Addr().String(), ":")
+		connStr := fmt.Sprintf("sslmode=disable host=%s port=%s channel_binding=require", host, port)
+
+		ctx, cancel := context.WithTimeout(context.Background(), time.Second*5)
+		defer cancel()
+
+		_, err = pgconn.Connect(ctx, connStr)
+		require.ErrorContains(t, err, "channel binding required but channel binding data is not available")
+	})
+
+	t.Run("RequireFailsWithoutServerPlus", func(t *testing.T) {
+		t.Parallel()
+
+		script := &pgmock.Script{
+			Steps: []pgmock.Step{
+				pgmock.ExpectAnyMessage(&pgproto3.StartupMessage{ProtocolVersion: pgproto3.ProtocolVersion30, Parameters: map[string]string{}}),
+				pgmock.SendMessage(&pgproto3.AuthenticationSASL{AuthMechanisms: []string{"SCRAM-SHA-256"}}),
+				pgmock.WaitForClose(),
+			},
+		}
+
+		ln, err := net.Listen("tcp", "127.0.0.1:")
+		require.NoError(t, err)
+		defer ln.Close()
+
+		serverErrChan := make(chan error, 1)
+		go func() {
+			defer close(serverErrChan)
+
+			conn, err := ln.Accept()
+			if err != nil {
+				serverErrChan <- err
+				return
+			}
+			defer conn.Close()
+
+			err = conn.SetDeadline(time.Now().Add(time.Second * 5))
+			if err != nil {
+				serverErrChan <- err
+				return
+			}
+
+			err = script.Run(pgproto3.NewBackend(conn, conn))
+			if err != nil {
+				serverErrChan <- err
+				return
+			}
+		}()
+
+		host, port, _ := strings.Cut(ln.Addr().String(), ":")
+		connStr := fmt.Sprintf("sslmode=disable host=%s port=%s channel_binding=require", host, port)
+
+		ctx, cancel := context.WithTimeout(context.Background(), time.Second*5)
+		defer cancel()
+
+		_, err = pgconn.Connect(ctx, connStr)
+		require.ErrorContains(t, err, "channel binding required but server does not support SCRAM-SHA-256-PLUS")
+	})
+}
+
+// TestConnectOAuth is separate from other connect tests because it specifically
+// needs a configured OAuthTokenProvider. Further it's only available in Postgres
+// 18+ and requires the dummy OAuth validator module installed.
+func TestConnectOAuth(t *testing.T) {
+	if os.Getenv(runOAuthTestEnvVar) != "true" {
+		t.Skipf("Skipping as '%s=true' is not set", runOAuthTestEnvVar)
+	}
+
+	config, err := pgconn.ParseConfig("host=127.0.0.1 user=pgx_oauth dbname=pgx_test")
 	require.NoError(t, err)
 
-	result := conn.ExecParams(ctx, `select ssl from pg_stat_ssl where pg_backend_pid() = pid;`, nil, nil, nil, nil).Read()
+	// Configure OAuthTokenProvider for dummy validator.
+	// The dummy validator accepts any token and maps it to the user equal to the
+	// token string.
+	config.OAuthTokenProvider = func(ctx context.Context) (string, error) {
+		return "pgx_oauth", nil
+	}
+
+	conn, err := pgconn.ConnectConfig(context.Background(), config)
+	require.NoError(t, err)
+	defer closeConn(t, conn)
+
+	result := conn.ExecParams(context.Background(), "SELECT CURRENT_USER", nil, nil, nil, nil).Read()
 	require.NoError(t, result.Err)
 	require.Len(t, result.Rows, 1)
 	require.Len(t, result.Rows[0], 1)
-	require.Equalf(t, "t", string(result.Rows[0][0]), "not a TLS connection")
+	require.Equalf(t, "pgx_oauth", string(result.Rows[0][0]), "not logged in as expected user.")
+}
 
-	closeConn(t, conn)
+func TestConnectOAuthError(t *testing.T) {
+	if os.Getenv(runOAuthTestEnvVar) != "true" {
+		t.Skipf("Skipping as '%s=true' is not set", runOAuthTestEnvVar)
+	}
+
+	config, err := pgconn.ParseConfig("host=127.0.0.1 user=pgx_oauth dbname=pgx_test")
+	require.NoError(t, err)
+
+	// Configure OAuthTokenProvider for dummy validator.
+	// The dummy validator accepts any token and maps it to the user equal to the
+	// token string. In this case that token will be accepted but as there is no
+	// user 'INVALID_TOKEN' the connection should fail.
+	config.OAuthTokenProvider = func(ctx context.Context) (string, error) {
+		return "INVALID_TOKEN", nil
+	}
+
+	_, err = pgconn.ConnectConfig(context.Background(), config)
+	require.Error(t, err, "connect should return error for invalid token")
 }
 
 func TestConnectTLSPasswordProtectedClientCertWithSSLPassword(t *testing.T) {
@@ -213,15 +438,14 @@ func TestConnectTimeout(t *testing.T) {
 		},
 	}
 	for _, tt := range tests {
-		tt := tt
 		t.Run(tt.name, func(t *testing.T) {
 			t.Parallel()
 			script := &pgmock.Script{
 				Steps: []pgmock.Step{
-					pgmock.ExpectAnyMessage(&pgproto3.StartupMessage{ProtocolVersion: pgproto3.ProtocolVersionNumber, Parameters: map[string]string{}}),
+					pgmock.ExpectAnyMessage(&pgproto3.StartupMessage{ProtocolVersion: pgproto3.ProtocolVersion30, Parameters: map[string]string{}}),
 					pgmock.SendMessage(&pgproto3.AuthenticationOk{}),
 					pgmockWaitStep(time.Millisecond * 500),
-					pgmock.SendMessage(&pgproto3.BackendKeyData{ProcessID: 0, SecretKey: 0}),
+					pgmock.SendMessage(&pgproto3.BackendKeyData{ProcessID: 0, SecretKey: []byte{0, 0, 0, 0}}),
 					pgmock.SendMessage(&pgproto3.ReadyForQuery{TxStatus: 'I'}),
 				},
 			}
@@ -292,7 +516,6 @@ func TestConnectTimeoutStuckOnTLSHandshake(t *testing.T) {
 		},
 	}
 	for _, tt := range tests {
-		tt := tt
 		t.Run(tt.name, func(t *testing.T) {
 			t.Parallel()
 			ln, err := net.Listen("tcp", "127.0.0.1:")
@@ -544,6 +767,63 @@ func TestConnectFailsWithResolveFailureAndFailedConnectionAttempts(t *testing.T)
 	require.ErrorContains(t, err, ":2 (127.0.0.1): dial error:")
 }
 
+type testConnWrapper struct {
+	conn net.Conn
+}
+
+func (w *testConnWrapper) Read(b []byte) (n int, err error) {
+	return w.conn.Read(b)
+}
+
+func (w *testConnWrapper) Write(b []byte) (n int, err error) {
+	return w.conn.Write(b)
+}
+
+func (w *testConnWrapper) Close() error {
+	return w.conn.Close()
+}
+
+func (w *testConnWrapper) LocalAddr() net.Addr {
+	return w.conn.LocalAddr()
+}
+
+func (w *testConnWrapper) RemoteAddr() net.Addr {
+	return w.conn.RemoteAddr()
+}
+
+func (w *testConnWrapper) SetDeadline(t time.Time) error {
+	return w.conn.SetDeadline(t)
+}
+
+func (w *testConnWrapper) SetReadDeadline(t time.Time) error {
+	return w.conn.SetReadDeadline(t)
+}
+
+func (w *testConnWrapper) SetWriteDeadline(t time.Time) error {
+	return w.conn.SetWriteDeadline(t)
+}
+
+func TestConnectWithAfterNetConnect(t *testing.T) {
+	t.Parallel()
+
+	ctx, cancel := context.WithTimeout(context.Background(), 120*time.Second)
+	defer cancel()
+
+	config, err := pgconn.ParseConfig(os.Getenv("PGX_TEST_DATABASE"))
+	require.NoError(t, err)
+
+	var wrappedConn net.Conn
+	config.AfterNetConnect = func(ctx context.Context, config *pgconn.Config, conn net.Conn) (net.Conn, error) {
+		wrappedConn = &testConnWrapper{conn: conn}
+		return wrappedConn, nil
+	}
+	conn, err := pgconn.ConnectConfig(ctx, config)
+	require.NoError(t, err)
+
+	require.Equal(t, wrappedConn, conn.Conn())
+	closeConn(t, conn)
+}
+
 func TestConnectWithValidateConnect(t *testing.T) {
 	t.Parallel()
 
@@ -637,6 +917,67 @@ func TestConnectConfigRequiresConfigFromParseConfig(t *testing.T) {
 	config := &pgconn.Config{}
 
 	require.PanicsWithValue(t, "config must be created by ParseConfig", func() { pgconn.ConnectConfig(ctx, config) })
+}
+
+func TestConnectConfigMaxProtocolMessageBodyLen(t *testing.T) {
+	t.Parallel()
+
+	ln, err := net.Listen("tcp", "127.0.0.1:")
+	require.NoError(t, err)
+	defer ln.Close()
+
+	serverErrChan := make(chan error, 1)
+	go func() {
+		defer close(serverErrChan)
+
+		conn, err := ln.Accept()
+		if err != nil {
+			serverErrChan <- err
+			return
+		}
+		defer conn.Close()
+
+		err = conn.SetDeadline(time.Now().Add(5 * time.Second))
+		if err != nil {
+			serverErrChan <- err
+			return
+		}
+
+		backend := pgproto3.NewBackend(conn, conn)
+		_, err = backend.ReceiveStartupMessage()
+		if err != nil {
+			serverErrChan <- err
+			return
+		}
+
+		// ParameterStatus declares a 6-octet body, which verifies that Config.MaxProtocolMessageBodyLen
+		// is installed before startup responses are received.
+		_, err = conn.Write([]byte{'S', 0, 0, 0, 10})
+		if err != nil {
+			serverErrChan <- err
+			return
+		}
+	}()
+
+	host, port, _ := strings.Cut(ln.Addr().String(), ":")
+	connStr := fmt.Sprintf("sslmode=disable host=%s port=%s", host, port)
+
+	ctx, cancel := context.WithTimeout(context.Background(), 5*time.Second)
+	defer cancel()
+
+	config, err := pgconn.ParseConfig(connStr)
+	require.NoError(t, err)
+	config.MaxProtocolMessageBodyLen = 5
+
+	conn, err := pgconn.ConnectConfig(ctx, config)
+	require.Nil(t, conn)
+
+	var bodyLenErr *pgproto3.ExceededMaxBodyLenErr
+	require.ErrorAs(t, err, &bodyLenErr)
+	assert.Equal(t, 5, bodyLenErr.MaxExpectedBodyLen)
+	assert.Equal(t, 6, bodyLenErr.ActualBodyLen)
+
+	require.NoError(t, <-serverErrChan)
 }
 
 func TestConnPrepareSyntaxError(t *testing.T) {
@@ -751,7 +1092,7 @@ func TestConnDeallocateSucceedsInAbortedTransaction(t *testing.T) {
 	ensureConnValid(t, pgConn)
 }
 
-func TestConnDeallocateNonExistantStatementSucceeds(t *testing.T) {
+func TestConnDeallocateNonExistentStatementSucceeds(t *testing.T) {
 	t.Parallel()
 
 	ctx, cancel := context.WithTimeout(context.Background(), 120*time.Second)
@@ -799,16 +1140,12 @@ func TestConnExecEmpty(t *testing.T) {
 	require.NoError(t, err)
 	defer closeConn(t, pgConn)
 
-	multiResult := pgConn.Exec(ctx, ";")
-
-	resultCount := 0
-	for multiResult.NextResult() {
-		resultCount++
-		multiResult.ResultReader().Close()
-	}
-	assert.Equal(t, 0, resultCount)
-	err = multiResult.Close()
-	assert.NoError(t, err)
+	results, err := pgConn.Exec(ctx, ";").ReadAll()
+	require.NoError(t, err)
+	require.Len(t, results, 1)
+	require.Nil(t, results[0].Err)
+	require.Equal(t, "", results[0].CommandTag.String())
+	require.Nil(t, results[0].FieldDescriptions)
 
 	ensureConnValid(t, pgConn)
 }
@@ -1062,7 +1399,7 @@ func TestConnExecParamsMaxNumberOfParams(t *testing.T) {
 	paramCount := math.MaxUint16
 	params := make([]string, 0, paramCount)
 	args := make([][]byte, 0, paramCount)
-	for i := 0; i < paramCount; i++ {
+	for i := range paramCount {
 		params = append(params, fmt.Sprintf("($%d::text)", i+1))
 		args = append(args, []byte(strconv.Itoa(i)))
 	}
@@ -1088,7 +1425,7 @@ func TestConnExecParamsTooManyParams(t *testing.T) {
 	paramCount := math.MaxUint16 + 1
 	params := make([]string, 0, paramCount)
 	args := make([][]byte, 0, paramCount)
-	for i := 0; i < paramCount; i++ {
+	for i := range paramCount {
 		params = append(params, fmt.Sprintf("($%d::text)", i+1))
 		args = append(args, []byte(strconv.Itoa(i)))
 	}
@@ -1262,7 +1599,7 @@ func TestConnExecPreparedMaxNumberOfParams(t *testing.T) {
 	paramCount := math.MaxUint16
 	params := make([]string, 0, paramCount)
 	args := make([][]byte, 0, paramCount)
-	for i := 0; i < paramCount; i++ {
+	for i := range paramCount {
 		params = append(params, fmt.Sprintf("($%d::text)", i+1))
 		args = append(args, []byte(strconv.Itoa(i)))
 	}
@@ -1294,7 +1631,7 @@ func TestConnExecPreparedTooManyParams(t *testing.T) {
 	paramCount := math.MaxUint16 + 1
 	params := make([]string, 0, paramCount)
 	args := make([][]byte, 0, paramCount)
-	for i := 0; i < paramCount; i++ {
+	for i := range paramCount {
 		params = append(params, fmt.Sprintf("($%d::text)", i+1))
 		args = append(args, []byte(strconv.Itoa(i)))
 	}
@@ -1393,6 +1730,189 @@ func TestConnExecPreparedEmptySQL(t *testing.T) {
 	ensureConnValid(t, pgConn)
 }
 
+func TestConnExecStatement(t *testing.T) {
+	t.Parallel()
+
+	ctx, cancel := context.WithTimeout(context.Background(), 120*time.Second)
+	defer cancel()
+
+	pgConn, err := pgconn.Connect(ctx, os.Getenv("PGX_TEST_DATABASE"))
+	require.NoError(t, err)
+	defer closeConn(t, pgConn)
+
+	psd, err := pgConn.Prepare(ctx, "ps1", "select $1::text as msg", nil)
+	require.NoError(t, err)
+	require.NotNil(t, psd)
+	assert.Len(t, psd.ParamOIDs, 1)
+	assert.Len(t, psd.Fields, 1)
+
+	result := pgConn.ExecStatement(ctx, psd, [][]byte{[]byte("Hello, world")}, nil, nil)
+	require.Len(t, result.FieldDescriptions(), 1)
+	assert.Equal(t, "msg", result.FieldDescriptions()[0].Name)
+
+	rowCount := 0
+	for result.NextRow() {
+		rowCount += 1
+		assert.Equal(t, "Hello, world", string(result.Values()[0]))
+	}
+	assert.Equal(t, 1, rowCount)
+	commandTag, err := result.Close()
+	assert.Equal(t, "SELECT 1", commandTag.String())
+	assert.NoError(t, err)
+
+	ensureConnValid(t, pgConn)
+}
+
+// https://github.com/jackc/pgx/issues/2626
+func TestConnExecStatementCursorFetch(t *testing.T) {
+	t.Parallel()
+
+	ctx, cancel := context.WithTimeout(context.Background(), 120*time.Second)
+	defer cancel()
+
+	pgConn, err := pgconn.Connect(ctx, os.Getenv("PGX_TEST_DATABASE"))
+	require.NoError(t, err)
+	defer closeConn(t, pgConn)
+
+	if pgConn.ParameterStatus("crdb_version") != "" {
+		t.Skip("Server does not support cursors in implicit transactions")
+	}
+
+	// Prepare the FETCH before the cursor exists. The server describes the result as NoData so the statement
+	// description has no fields. The actual fields are only known at execution time.
+	sd, err := pgConn.Prepare(ctx, "ps_fetch", `fetch all in "exec_statement_cursor"`, nil)
+	require.NoError(t, err)
+	require.Empty(t, sd.Fields)
+
+	// DECLARE CURSOR requires an explicit transaction block.
+	_, err = pgConn.Exec(ctx, "begin").ReadAll()
+	require.NoError(t, err)
+
+	_, err = pgConn.Exec(ctx, `declare "exec_statement_cursor" cursor for select n, n::text from generate_series(1, 3) n`).ReadAll()
+	require.NoError(t, err)
+
+	result := pgConn.ExecStatement(ctx, sd, nil, nil, nil).Read()
+	require.NoError(t, result.Err)
+	require.Len(t, result.FieldDescriptions, 2)
+	require.Equal(t, uint32(pgtype.Int4OID), result.FieldDescriptions[0].DataTypeOID)
+	require.Equal(t, uint32(pgtype.TextOID), result.FieldDescriptions[1].DataTypeOID)
+	require.Len(t, result.Rows, 3)
+	require.Equal(t, "1", string(result.Rows[0][0]))
+	require.Equal(t, "3", string(result.Rows[2][1]))
+
+	_, err = pgConn.Exec(ctx, "rollback").ReadAll()
+	require.NoError(t, err)
+
+	ensureConnValid(t, pgConn)
+}
+
+type byteCounterConn struct {
+	conn         net.Conn
+	bytesRead    int
+	bytesWritten int
+}
+
+func (cbn *byteCounterConn) Read(b []byte) (n int, err error) {
+	n, err = cbn.conn.Read(b)
+	cbn.bytesRead += n
+	return n, err
+}
+
+func (cbn *byteCounterConn) Write(b []byte) (n int, err error) {
+	n, err = cbn.conn.Write(b)
+	cbn.bytesWritten += n
+	return n, err
+}
+
+func (cbn *byteCounterConn) Close() error {
+	return cbn.conn.Close()
+}
+
+func (cbn *byteCounterConn) LocalAddr() net.Addr {
+	return cbn.conn.LocalAddr()
+}
+
+func (cbn *byteCounterConn) RemoteAddr() net.Addr {
+	return cbn.conn.RemoteAddr()
+}
+
+func (cbn *byteCounterConn) SetDeadline(t time.Time) error {
+	return cbn.conn.SetDeadline(t)
+}
+
+func (cbn *byteCounterConn) SetReadDeadline(t time.Time) error {
+	return cbn.conn.SetReadDeadline(t)
+}
+
+func (cbn *byteCounterConn) SetWriteDeadline(t time.Time) error {
+	return cbn.conn.SetWriteDeadline(t)
+}
+
+func TestConnExecStatementNetworkUsage(t *testing.T) {
+	t.Parallel()
+
+	ctx, cancel := context.WithTimeout(context.Background(), 120*time.Second)
+	defer cancel()
+
+	config, err := pgconn.ParseConfig(os.Getenv("PGX_TEST_DATABASE"))
+	require.NoError(t, err)
+
+	var counterConn *byteCounterConn
+	config.AfterNetConnect = func(ctx context.Context, config *pgconn.Config, conn net.Conn) (net.Conn, error) {
+		counterConn = &byteCounterConn{conn: conn}
+		return counterConn, nil
+	}
+
+	pgConn, err := pgconn.ConnectConfig(ctx, config)
+	require.NoError(t, err)
+	defer closeConn(t, pgConn)
+	require.NotNil(t, counterConn)
+
+	if pgConn.ParameterStatus("crdb_version") != "" {
+		t.Skip("Server uses different number of bytes for same operations")
+	}
+
+	psd, err := pgConn.Prepare(ctx, "ps1", "select n, 'Adam', 'Smith ' || n, 'male', '1952-06-16'::date, 258, 72, '{foo,bar,baz}'::text[], '2001-01-28 01:02:03-05'::timestamptz from generate_series(100001, 100000 + $1) n", nil)
+	require.NoError(t, err)
+	require.NotNil(t, psd)
+	assert.Len(t, psd.ParamOIDs, 1)
+	assert.Len(t, psd.Fields, 9)
+
+	counterConn.bytesWritten = 0
+	counterConn.bytesRead = 0
+
+	result := pgConn.ExecPrepared(ctx,
+		psd.Name,
+		[][]byte{[]byte("1")},
+		nil,
+		[]int16{pgx.BinaryFormatCode, pgx.TextFormatCode, pgx.TextFormatCode, pgx.TextFormatCode, pgx.BinaryFormatCode, pgx.BinaryFormatCode, pgx.BinaryFormatCode, pgx.BinaryFormatCode, pgx.BinaryFormatCode},
+	).Read()
+	require.NoError(t, result.Err)
+	withDescribeBytesWritten := counterConn.bytesWritten
+	withDescribeBytesRead := counterConn.bytesRead
+
+	counterConn.bytesWritten = 0
+	counterConn.bytesRead = 0
+
+	result = pgConn.ExecStatement(
+		ctx,
+		psd,
+		[][]byte{[]byte("1")},
+		nil,
+		[]int16{pgx.BinaryFormatCode, pgx.TextFormatCode, pgx.TextFormatCode, pgx.TextFormatCode, pgx.BinaryFormatCode, pgx.BinaryFormatCode, pgx.BinaryFormatCode, pgx.BinaryFormatCode, pgx.BinaryFormatCode},
+	).Read()
+	require.NoError(t, result.Err)
+	noDescribeBytesWritten := counterConn.bytesWritten
+	noDescribeBytesRead := counterConn.bytesRead
+
+	assert.Equal(t, 61, withDescribeBytesWritten)
+	assert.Equal(t, 54, noDescribeBytesWritten)
+	assert.Equal(t, 391, withDescribeBytesRead)
+	assert.Equal(t, 153, noDescribeBytesRead)
+
+	ensureConnValid(t, pgConn)
+}
+
 func TestConnExecBatch(t *testing.T) {
 	t.Parallel()
 
@@ -1406,14 +1926,20 @@ func TestConnExecBatch(t *testing.T) {
 	_, err = pgConn.Prepare(ctx, "ps1", "select $1::text", nil)
 	require.NoError(t, err)
 
+	sd, err := pgConn.Prepare(ctx, "ps2", "select $1::text as name, $2::bigint as age", nil)
+	require.NoError(t, err)
+
 	batch := &pgconn.Batch{}
 
 	batch.ExecParams("select $1::text", [][]byte{[]byte("ExecParams 1")}, nil, nil, nil)
 	batch.ExecPrepared("ps1", [][]byte{[]byte("ExecPrepared 1")}, nil, nil)
+	batch.ExecStatement(sd, [][]byte{[]byte("ExecStatement 1"), []byte("42")}, nil, nil)
+	batch.ExecStatement(sd, [][]byte{[]byte("ExecStatement 2"), []byte("43")}, nil, []int16{pgx.BinaryFormatCode})
+	batch.ExecStatement(sd, [][]byte{[]byte("ExecStatement 3"), []byte("44")}, nil, []int16{pgx.TextFormatCode, pgx.BinaryFormatCode})
 	batch.ExecParams("select $1::text", [][]byte{[]byte("ExecParams 2")}, nil, nil, nil)
 	results, err := pgConn.ExecBatch(ctx, batch).ReadAll()
 	require.NoError(t, err)
-	require.Len(t, results, 3)
+	require.Len(t, results, 6)
 
 	require.Len(t, results[0].Rows, 1)
 	require.Equal(t, "ExecParams 1", string(results[0].Rows[0][0]))
@@ -1424,8 +1950,131 @@ func TestConnExecBatch(t *testing.T) {
 	assert.Equal(t, "SELECT 1", results[1].CommandTag.String())
 
 	require.Len(t, results[2].Rows, 1)
-	require.Equal(t, "ExecParams 2", string(results[2].Rows[0][0]))
+	require.Equal(t, "ExecStatement 1", string(results[2].Rows[0][0]))
+	require.Equal(t, "42", string(results[2].Rows[0][1]))
 	assert.Equal(t, "SELECT 1", results[2].CommandTag.String())
+
+	require.Len(t, results[3].Rows, 1)
+	require.Equal(t, "ExecStatement 2", string(results[3].Rows[0][0]))
+	require.Equal(t, []byte{0, 0, 0, 0, 0, 0, 0, 43}, results[3].Rows[0][1])
+	assert.Equal(t, "SELECT 1", results[3].CommandTag.String())
+
+	require.Len(t, results[4].Rows, 1)
+	require.Equal(t, "ExecStatement 3", string(results[4].Rows[0][0]))
+	require.Equal(t, []byte{0, 0, 0, 0, 0, 0, 0, 44}, results[4].Rows[0][1])
+	assert.Equal(t, "SELECT 1", results[4].CommandTag.String())
+
+	require.Len(t, results[5].Rows, 1)
+	require.Equal(t, "ExecParams 2", string(results[5].Rows[0][0]))
+	assert.Equal(t, "SELECT 1", results[2].CommandTag.String())
+}
+
+func TestConnExecBatchStatementNoRows(t *testing.T) {
+	t.Parallel()
+
+	ctx, cancel := context.WithTimeout(context.Background(), 120*time.Second)
+	defer cancel()
+
+	pgConn, err := pgconn.Connect(ctx, os.Getenv("PGX_TEST_DATABASE"))
+	require.NoError(t, err)
+	defer closeConn(t, pgConn)
+
+	sdNoRows, err := pgConn.Prepare(ctx, "ps_norows", "select 1::int4 as n where false", nil)
+	require.NoError(t, err)
+	require.Len(t, sdNoRows.Fields, 1)
+
+	sdRows, err := pgConn.Prepare(ctx, "ps_rows", "select 42::int4 as n, 'abc'::text as s", nil)
+	require.NoError(t, err)
+	require.Len(t, sdRows.Fields, 2)
+
+	// An ExecStatement command that returns no rows must not leave its statement description queued. Otherwise all
+	// subsequent ExecStatement results would be misaligned with their statement descriptions.
+	batch := &pgconn.Batch{}
+	batch.ExecStatement(sdNoRows, nil, nil, nil)
+	batch.ExecStatement(sdRows, nil, nil, nil)
+	batch.ExecParams("select 'p'::text", nil, nil, nil, nil)
+
+	mrr := pgConn.ExecBatch(ctx, batch)
+
+	require.True(t, mrr.NextResult())
+	rr := mrr.ResultReader()
+	require.Len(t, rr.FieldDescriptions(), 1)
+	require.Equal(t, "n", rr.FieldDescriptions()[0].Name)
+	result := rr.Read()
+	require.NoError(t, result.Err)
+	require.Len(t, result.Rows, 0)
+	require.Equal(t, "SELECT 0", result.CommandTag.String())
+
+	require.True(t, mrr.NextResult())
+	rr = mrr.ResultReader()
+	require.Len(t, rr.FieldDescriptions(), 2)
+	require.Equal(t, "n", rr.FieldDescriptions()[0].Name)
+	require.Equal(t, "s", rr.FieldDescriptions()[1].Name)
+	result = rr.Read()
+	require.NoError(t, result.Err)
+	require.Len(t, result.Rows, 1)
+	require.Equal(t, "42", string(result.Rows[0][0]))
+	require.Equal(t, "abc", string(result.Rows[0][1]))
+	require.Equal(t, "SELECT 1", result.CommandTag.String())
+
+	require.True(t, mrr.NextResult())
+	result = mrr.ResultReader().Read()
+	require.NoError(t, result.Err)
+	require.Len(t, result.Rows, 1)
+	require.Equal(t, "p", string(result.Rows[0][0]))
+
+	require.False(t, mrr.NextResult())
+	require.NoError(t, mrr.Close())
+
+	ensureConnValid(t, pgConn)
+}
+
+// https://github.com/jackc/pgx/issues/2626
+func TestConnExecBatchStatementCursorFetch(t *testing.T) {
+	t.Parallel()
+
+	ctx, cancel := context.WithTimeout(context.Background(), 120*time.Second)
+	defer cancel()
+
+	pgConn, err := pgconn.Connect(ctx, os.Getenv("PGX_TEST_DATABASE"))
+	require.NoError(t, err)
+	defer closeConn(t, pgConn)
+
+	if pgConn.ParameterStatus("crdb_version") != "" {
+		t.Skip("Server does not support cursors in implicit transactions")
+	}
+
+	// Prepare the FETCH before the cursor exists. The server describes the result as NoData so the statement
+	// description has no fields. The actual fields are only known at execution time.
+	sd, err := pgConn.Prepare(ctx, "ps_batch_fetch", `fetch all in "exec_batch_cursor"`, nil)
+	require.NoError(t, err)
+	require.Empty(t, sd.Fields)
+
+	// DECLARE CURSOR requires an explicit transaction block.
+	_, err = pgConn.Exec(ctx, "begin").ReadAll()
+	require.NoError(t, err)
+
+	batch := &pgconn.Batch{}
+	batch.ExecParams(`declare "exec_batch_cursor" cursor for select n, n::text from generate_series(1, 3) n`, nil, nil, nil, nil)
+	batch.ExecStatement(sd, nil, nil, nil)
+
+	results, err := pgConn.ExecBatch(ctx, batch).ReadAll()
+	require.NoError(t, err)
+	require.Len(t, results, 2)
+
+	fetchResult := results[1]
+	require.NoError(t, fetchResult.Err)
+	require.Len(t, fetchResult.FieldDescriptions, 2)
+	require.Equal(t, uint32(pgtype.Int4OID), fetchResult.FieldDescriptions[0].DataTypeOID)
+	require.Equal(t, uint32(pgtype.TextOID), fetchResult.FieldDescriptions[1].DataTypeOID)
+	require.Len(t, fetchResult.Rows, 3)
+	require.Equal(t, "1", string(fetchResult.Rows[0][0]))
+	require.Equal(t, "3", string(fetchResult.Rows[2][1]))
+
+	_, err = pgConn.Exec(ctx, "rollback").ReadAll()
+	require.NoError(t, err)
+
+	ensureConnValid(t, pgConn)
 }
 
 type mockConnection struct {
@@ -1558,7 +2207,7 @@ func TestConnExecBatchHuge(t *testing.T) {
 
 	batch := &pgconn.Batch{}
 
-	queryCount := 100000
+	queryCount := 100_000
 	args := make([]string, queryCount)
 
 	for i := range args {
@@ -1870,7 +2519,7 @@ func TestConnCopyToLarge(t *testing.T) {
 
 	inputBytes := make([]byte, 0)
 
-	for i := 0; i < 1000; i++ {
+	for range 1000 {
 		_, err = pgConn.Exec(ctx, `insert into foo values (0, 1, 2, 'abc', 'efg', '2000-01-01', '{"abc":"def","foo":"bar"}', 'oooo')`).ReadAll()
 		require.NoError(t, err)
 		inputBytes = append(inputBytes, "0\t1\t2\tabc\tefg\t2000-01-01\t{\"abc\":\"def\",\"foo\":\"bar\"}\t\\\\x6f6f6f6f\n"...)
@@ -1978,11 +2627,11 @@ func TestConnCopyFrom(t *testing.T) {
 	srcBuf := &bytes.Buffer{}
 
 	inputRows := [][][]byte{}
-	for i := 0; i < 1000; i++ {
+	for i := range 1000 {
 		a := strconv.Itoa(i)
 		b := "foo " + a + " bar"
 		inputRows = append(inputRows, [][]byte{[]byte(a), []byte(b)})
-		_, err = srcBuf.Write([]byte(fmt.Sprintf("%s,\"%s\"\n", a, b)))
+		_, err = srcBuf.Write(fmt.Appendf(nil, "%s,\"%s\"\n", a, b))
 		require.NoError(t, err)
 	}
 
@@ -2024,7 +2673,7 @@ func TestConnCopyFromBinary(t *testing.T) {
 	buf = pgio.AppendInt32(buf, 0)
 
 	inputRows := [][][]byte{}
-	for i := 0; i < 1000; i++ {
+	for i := range 1000 {
 		// Number of elements in the tuple
 		buf = pgio.AppendInt16(buf, int16(2))
 		a := i
@@ -2076,10 +2725,10 @@ func TestConnCopyFromCanceled(t *testing.T) {
 
 	r, w := io.Pipe()
 	go func() {
-		for i := 0; i < 1000000; i++ {
+		for i := range 1_000_000 {
 			a := strconv.Itoa(i)
 			b := "foo " + a + " bar"
-			_, err := w.Write([]byte(fmt.Sprintf("%s,\"%s\"\n", a, b)))
+			_, err := w.Write(fmt.Appendf(nil, "%s,\"%s\"\n", a, b))
 			if err != nil {
 				return
 			}
@@ -2123,10 +2772,10 @@ func TestConnCopyFromPrecanceled(t *testing.T) {
 
 	r, w := io.Pipe()
 	go func() {
-		for i := 0; i < 1000000; i++ {
+		for i := range 1_000_000 {
 			a := strconv.Itoa(i)
 			b := "foo " + a + " bar"
-			_, err := w.Write([]byte(fmt.Sprintf("%s,\"%s\"\n", a, b)))
+			_, err := w.Write(fmt.Appendf(nil, "%s,\"%s\"\n", a, b))
 			if err != nil {
 				return
 			}
@@ -2162,12 +2811,11 @@ func TestConnCopyFromConnectionTerminated(t *testing.T) {
 
 	closerConn, err := pgconn.Connect(ctx, os.Getenv("PGX_TEST_DATABASE"))
 	require.NoError(t, err)
+	defer closeConn(t, closerConn)
+	errChan := make(chan error, 1)
 	time.AfterFunc(500*time.Millisecond, func() {
-		// defer inside of AfterFunc instead of outer test function because outer function can finish while Read is still in
-		// progress which could cause closerConn to be closed too soon.
-		defer closeConn(t, closerConn)
-		err := closerConn.ExecParams(ctx, "select pg_terminate_backend($1)", [][]byte{[]byte(fmt.Sprintf("%d", pgConn.PID()))}, nil, nil, nil).Read().Err
-		require.NoError(t, err)
+		err := closerConn.ExecParams(ctx, "select pg_terminate_backend($1)", [][]byte{fmt.Appendf(nil, "%d", pgConn.PID())}, nil, nil, nil).Read().Err
+		errChan <- err
 	})
 
 	_, err = pgConn.Exec(ctx, `create temporary table foo(
@@ -2178,10 +2826,10 @@ func TestConnCopyFromConnectionTerminated(t *testing.T) {
 
 	r, w := io.Pipe()
 	go func() {
-		for i := 0; i < 5_000; i++ {
+		for i := range 5_000 {
 			a := strconv.Itoa(i)
 			b := "foo " + a + " bar"
-			_, err := w.Write([]byte(fmt.Sprintf("%s,\"%s\"\n", a, b)))
+			_, err := w.Write(fmt.Appendf(nil, "%s,\"%s\"\n", a, b))
 			if err != nil {
 				return
 			}
@@ -2200,6 +2848,9 @@ func TestConnCopyFromConnectionTerminated(t *testing.T) {
 	case <-time.After(5 * time.Second):
 		t.Fatal("Connection cleanup exceeded maximum time")
 	}
+
+	err = <-errChan
+	require.NoError(t, err)
 }
 
 func TestConnCopyFromGzipReader(t *testing.T) {
@@ -2229,11 +2880,11 @@ func TestConnCopyFromGzipReader(t *testing.T) {
 	gw := gzip.NewWriter(f)
 
 	inputRows := [][][]byte{}
-	for i := 0; i < 1000; i++ {
+	for i := range 1000 {
 		a := strconv.Itoa(i)
 		b := "foo " + a + " bar"
 		inputRows = append(inputRows, [][]byte{[]byte(a), []byte(b)})
-		_, err = gw.Write([]byte(fmt.Sprintf("%s,\"%s\"\n", a, b)))
+		_, err = gw.Write(fmt.Appendf(nil, "%s,\"%s\"\n", a, b))
 		require.NoError(t, err)
 	}
 
@@ -2286,11 +2937,11 @@ func TestConnCopyFromQuerySyntaxError(t *testing.T) {
 	// Send data even though the COPY FROM command will be rejected with a syntax error. This ensures that this does not
 	// break the connection. See https://github.com/jackc/pgconn/pull/127 for context.
 	inputRows := [][][]byte{}
-	for i := 0; i < 1000; i++ {
+	for i := range 1000 {
 		a := strconv.Itoa(i)
 		b := "foo " + a + " bar"
 		inputRows = append(inputRows, [][]byte{[]byte(a), []byte(b)})
-		_, err = srcBuf.Write([]byte(fmt.Sprintf("%s,\"%s\"\n", a, b)))
+		_, err = srcBuf.Write(fmt.Appendf(nil, "%s,\"%s\"\n", a, b))
 		require.NoError(t, err)
 	}
 
@@ -2360,8 +3011,8 @@ func TestConnCopyFromNoticeResponseReceivedMidStream(t *testing.T) {
 	}
 
 	buf := &bytes.Buffer{}
-	for i := 0; i < 1000; i++ {
-		buf.Write([]byte(fmt.Sprintf("%s\n", string(longString))))
+	for range 1000 {
+		buf.Write(fmt.Appendf(nil, "%s\n", string(longString)))
 	}
 
 	_, err = pgConn.CopyFrom(ctx, buf, "COPY sentences(t) FROM STDIN WITH (FORMAT csv)")
@@ -2601,6 +3252,26 @@ func TestHijackAndConstruct(t *testing.T) {
 	ensureConnValid(t, newConn)
 }
 
+// Operations on a closed connection should surface an error that
+// satisfies errors.Is(err, pgconn.ErrConnClosed) so callers can tell a
+// dead-transport failure apart from things like a *PgError.
+// See https://github.com/jackc/pgx/issues/2557.
+func TestExecOnClosedConnErrConnClosed(t *testing.T) {
+	t.Parallel()
+
+	ctx, cancel := context.WithTimeout(context.Background(), 120*time.Second)
+	defer cancel()
+
+	pgConn, err := pgconn.Connect(ctx, os.Getenv("PGX_TEST_DATABASE"))
+	require.NoError(t, err)
+
+	require.NoError(t, pgConn.Close(ctx))
+
+	_, err = pgConn.Exec(ctx, "select 1").ReadAll()
+	require.Error(t, err)
+	assert.ErrorIs(t, err, pgconn.ErrConnClosed)
+}
+
 func TestConnCloseWhileCancellableQueryInProgress(t *testing.T) {
 	t.Parallel()
 
@@ -2612,7 +3283,8 @@ func TestConnCloseWhileCancellableQueryInProgress(t *testing.T) {
 
 	pgConn.Exec(ctx, "select n from generate_series(1,10) n")
 
-	closeCtx, _ := context.WithCancel(ctx)
+	closeCtx, closeCancel := context.WithCancel(ctx)
+	defer closeCancel()
 	pgConn.Close(closeCtx)
 	select {
 	case <-pgConn.CleanupDone():
@@ -2707,7 +3379,7 @@ func TestConnLargeResponseWhileWritingDoesNotDeadlock(t *testing.T) {
 	paramCount := math.MaxUint16
 	params := make([]string, 0, paramCount)
 	args := make([][]byte, 0, paramCount)
-	for i := 0; i < paramCount; i++ {
+	for i := range paramCount {
 		params = append(params, fmt.Sprintf("($%d::text)", i+1))
 		args = append(args, []byte(strconv.Itoa(i)))
 	}
@@ -2828,7 +3500,7 @@ func TestPipelinePrepare(t *testing.T) {
 	sd, ok := results.(*pgconn.StatementDescription)
 	require.Truef(t, ok, "expected StatementDescription, got: %#v", results)
 	require.Len(t, sd.Fields, 1)
-	require.Equal(t, "a", string(sd.Fields[0].Name))
+	require.Equal(t, "a", sd.Fields[0].Name)
 	require.Equal(t, []uint32{pgtype.Int8OID}, sd.ParamOIDs)
 
 	results, err = pipeline.GetResults()
@@ -2836,7 +3508,7 @@ func TestPipelinePrepare(t *testing.T) {
 	sd, ok = results.(*pgconn.StatementDescription)
 	require.Truef(t, ok, "expected StatementDescription, got: %#v", results)
 	require.Len(t, sd.Fields, 1)
-	require.Equal(t, "b", string(sd.Fields[0].Name))
+	require.Equal(t, "b", sd.Fields[0].Name)
 	require.Equal(t, []uint32{pgtype.TextOID}, sd.ParamOIDs)
 
 	results, err = pipeline.GetResults()
@@ -2844,7 +3516,7 @@ func TestPipelinePrepare(t *testing.T) {
 	sd, ok = results.(*pgconn.StatementDescription)
 	require.Truef(t, ok, "expected StatementDescription, got: %#v", results)
 	require.Len(t, sd.Fields, 1)
-	require.Equal(t, "c", string(sd.Fields[0].Name))
+	require.Equal(t, "c", sd.Fields[0].Name)
 	require.Equal(t, []uint32{}, sd.ParamOIDs)
 
 	results, err = pipeline.GetResults()
@@ -2898,7 +3570,7 @@ func TestPipelinePrepareError(t *testing.T) {
 	sd, ok := results.(*pgconn.StatementDescription)
 	require.Truef(t, ok, "expected StatementDescription, got: %#v", results)
 	require.Len(t, sd.Fields, 1)
-	require.Equal(t, "a", string(sd.Fields[0].Name))
+	require.Equal(t, "a", sd.Fields[0].Name)
 	require.Equal(t, []uint32{pgtype.Int8OID}, sd.ParamOIDs)
 
 	results, err = pipeline.GetResults()
@@ -2945,7 +3617,7 @@ func TestPipelinePrepareAndDeallocate(t *testing.T) {
 	sd, ok := results.(*pgconn.StatementDescription)
 	require.Truef(t, ok, "expected StatementDescription, got: %#v", results)
 	require.Len(t, sd.Fields, 1)
-	require.Equal(t, "a", string(sd.Fields[0].Name))
+	require.Equal(t, "a", sd.Fields[0].Name)
 	require.Equal(t, []uint32{pgtype.Int8OID}, sd.ParamOIDs)
 
 	results, err = pipeline.GetResults()
@@ -3082,7 +3754,7 @@ func TestPipelinePrepareQuery(t *testing.T) {
 	sd, ok := results.(*pgconn.StatementDescription)
 	require.Truef(t, ok, "expected StatementDescription, got: %#v", results)
 	require.Len(t, sd.Fields, 1)
-	require.Equal(t, "msg", string(sd.Fields[0].Name))
+	require.Equal(t, "msg", sd.Fields[0].Name)
 	require.Equal(t, []uint32{pgtype.TextOID}, sd.ParamOIDs)
 
 	results, err = pipeline.GetResults()
@@ -3113,6 +3785,221 @@ func TestPipelinePrepareQuery(t *testing.T) {
 	results, err = pipeline.GetResults()
 	require.NoError(t, err)
 	require.Nil(t, results)
+
+	err = pipeline.Close()
+	require.NoError(t, err)
+
+	ensureConnValid(t, pgConn)
+}
+
+// https://github.com/jackc/pgx/issues/2601
+func TestPipelineEmptyQuery(t *testing.T) {
+	t.Parallel()
+
+	ctx, cancel := context.WithTimeout(context.Background(), 120*time.Second)
+	defer cancel()
+
+	pgConn, err := pgconn.Connect(ctx, os.Getenv("PGX_TEST_DATABASE"))
+	require.NoError(t, err)
+	defer closeConn(t, pgConn)
+
+	sd, err := pgConn.Prepare(ctx, "ps_empty", "-- comment-only query", nil)
+	require.NoError(t, err)
+
+	pipeline := pgConn.StartPipeline(ctx)
+	pipeline.SendQueryParams(`-- comment-only query`, nil, nil, nil, nil)
+	pipeline.SendQueryPrepared(`ps_empty`, nil, nil, nil)
+	pipeline.SendQueryStatement(sd, nil, nil, nil)
+	err = pipeline.Sync()
+	require.NoError(t, err)
+
+	for _, requestType := range []string{"QueryParams", "QueryPrepared", "QueryStatement"} {
+		results, err := pipeline.GetResults()
+		require.NoErrorf(t, err, "%s", requestType)
+		rr, ok := results.(*pgconn.ResultReader)
+		require.Truef(t, ok, "%s: expected ResultReader, got: %#v", requestType, results)
+		readResult := rr.Read()
+		require.NoErrorf(t, readResult.Err, "%s", requestType)
+		require.Lenf(t, readResult.Rows, 0, "%s", requestType)
+		require.Equalf(t, "", readResult.CommandTag.String(), "%s", requestType)
+	}
+
+	results, err := pipeline.GetResults()
+	require.NoError(t, err)
+	_, ok := results.(*pgconn.PipelineSync)
+	require.Truef(t, ok, "expected PipelineSync, got: %#v", results)
+
+	err = pipeline.Close()
+	require.NoError(t, err)
+
+	ensureConnValid(t, pgConn)
+}
+
+func TestPipelineQueryStatementBindError(t *testing.T) {
+	t.Parallel()
+
+	ctx, cancel := context.WithTimeout(context.Background(), 120*time.Second)
+	defer cancel()
+
+	pgConn, err := pgconn.Connect(ctx, os.Getenv("PGX_TEST_DATABASE"))
+	require.NoError(t, err)
+	defer closeConn(t, pgConn)
+
+	sdA, err := pgConn.Prepare(ctx, "ps_a", "select $1::int8, $2::text", nil)
+	require.NoError(t, err)
+	sdB, err := pgConn.Prepare(ctx, "ps_b", "select $1::text", nil)
+	require.NoError(t, err)
+
+	pipeline := pgConn.StartPipeline(ctx)
+
+	// Bind error: sdA takes two parameters but only one is sent.
+	pipeline.SendQueryStatement(sdA, [][]byte{[]byte("1")}, []int16{0}, []int16{1, 0})
+	err = pipeline.Sync()
+	require.NoError(t, err)
+
+	results, err := pipeline.GetResults()
+	var pgErr *pgconn.PgError
+	require.ErrorAs(t, err, &pgErr)
+	require.Nil(t, results)
+
+	results, err = pipeline.GetResults()
+	require.NoError(t, err)
+	_, ok := results.(*pgconn.PipelineSync)
+	require.Truef(t, ok, "expected PipelineSync, got: %#v", results)
+
+	// The statement data for the failed query must not still be in the queue where it would be misaligned with
+	// this query.
+	pipeline.SendQueryStatement(sdB, [][]byte{[]byte("hello")}, []int16{0}, []int16{0})
+	err = pipeline.Sync()
+	require.NoError(t, err)
+
+	results, err = pipeline.GetResults()
+	require.NoError(t, err)
+	rr, ok := results.(*pgconn.ResultReader)
+	require.Truef(t, ok, "expected ResultReader, got: %#v", results)
+	fds := rr.FieldDescriptions()
+	require.Len(t, fds, 1)
+	require.Equal(t, uint32(pgtype.TextOID), fds[0].DataTypeOID)
+	readResult := rr.Read()
+	require.NoError(t, readResult.Err)
+	require.Len(t, readResult.Rows, 1)
+	require.Equal(t, "hello", string(readResult.Rows[0][0]))
+
+	results, err = pipeline.GetResults()
+	require.NoError(t, err)
+	_, ok = results.(*pgconn.PipelineSync)
+	require.Truef(t, ok, "expected PipelineSync, got: %#v", results)
+
+	err = pipeline.Close()
+	require.NoError(t, err)
+
+	ensureConnValid(t, pgConn)
+}
+
+// https://github.com/jackc/pgx/issues/2626
+func TestPipelineQueryStatementCursorFetch(t *testing.T) {
+	t.Parallel()
+
+	ctx, cancel := context.WithTimeout(context.Background(), 120*time.Second)
+	defer cancel()
+
+	pgConn, err := pgconn.Connect(ctx, os.Getenv("PGX_TEST_DATABASE"))
+	require.NoError(t, err)
+	defer closeConn(t, pgConn)
+
+	if pgConn.ParameterStatus("crdb_version") != "" {
+		t.Skip("Server does not support cursors in implicit transactions")
+	}
+
+	// Prepare the FETCH before the cursor exists. The server describes the result as NoData so the statement
+	// description has no fields. The actual fields are only known at execution time.
+	sd, err := pgConn.Prepare(ctx, "ps_fetch", `fetch all in "pipeline_cursor"`, nil)
+	require.NoError(t, err)
+	require.Empty(t, sd.Fields)
+
+	// DECLARE CURSOR requires an explicit transaction block.
+	_, err = pgConn.Exec(ctx, "begin").ReadAll()
+	require.NoError(t, err)
+
+	pipeline := pgConn.StartPipeline(ctx)
+	pipeline.SendQueryParams(`declare "pipeline_cursor" cursor for select n, n::text from generate_series(1, 3) n`, nil, nil, nil, nil)
+	pipeline.SendQueryStatement(sd, nil, nil, nil)
+	err = pipeline.Sync()
+	require.NoError(t, err)
+
+	results, err := pipeline.GetResults()
+	require.NoError(t, err)
+	rr, ok := results.(*pgconn.ResultReader)
+	require.Truef(t, ok, "expected ResultReader, got: %#v", results)
+	readResult := rr.Read()
+	require.NoError(t, readResult.Err)
+
+	results, err = pipeline.GetResults()
+	require.NoError(t, err)
+	rr, ok = results.(*pgconn.ResultReader)
+	require.Truef(t, ok, "expected ResultReader, got: %#v", results)
+	readResult = rr.Read()
+	require.NoError(t, readResult.Err)
+	require.Len(t, readResult.FieldDescriptions, 2)
+	require.Equal(t, uint32(pgtype.Int4OID), readResult.FieldDescriptions[0].DataTypeOID)
+	require.Equal(t, uint32(pgtype.TextOID), readResult.FieldDescriptions[1].DataTypeOID)
+	require.Len(t, readResult.Rows, 3)
+	require.Equal(t, "1", string(readResult.Rows[0][0]))
+	require.Equal(t, "3", string(readResult.Rows[2][1]))
+
+	results, err = pipeline.GetResults()
+	require.NoError(t, err)
+	_, ok = results.(*pgconn.PipelineSync)
+	require.Truef(t, ok, "expected PipelineSync, got: %#v", results)
+
+	err = pipeline.Close()
+	require.NoError(t, err)
+
+	_, err = pgConn.Exec(ctx, "rollback").ReadAll()
+	require.NoError(t, err)
+
+	ensureConnValid(t, pgConn)
+}
+
+func TestPipelineGetResultsNilResultsOnError(t *testing.T) {
+	t.Parallel()
+
+	ctx, cancel := context.WithTimeout(context.Background(), 120*time.Second)
+	defer cancel()
+
+	pgConn, err := pgconn.Connect(ctx, os.Getenv("PGX_TEST_DATABASE"))
+	require.NoError(t, err)
+	defer closeConn(t, pgConn)
+
+	pipeline := pgConn.StartPipeline(ctx)
+
+	pipeline.SendPrepare("ps_err", "wat", nil)
+	err = pipeline.Sync()
+	require.NoError(t, err)
+
+	results, err := pipeline.GetResults()
+	var pgErr *pgconn.PgError
+	require.ErrorAs(t, err, &pgErr)
+	// results must be an untyped nil, not an interface containing a typed nil pointer.
+	require.Truef(t, results == nil, "expected nil results, got: %#v", results)
+
+	results, err = pipeline.GetResults()
+	require.NoError(t, err)
+	_, ok := results.(*pgconn.PipelineSync)
+	require.Truef(t, ok, "expected PipelineSync, got: %#v", results)
+
+	pipeline.SendQueryParams(`wat`, nil, nil, nil, nil)
+	err = pipeline.Sync()
+	require.NoError(t, err)
+
+	results, err = pipeline.GetResults()
+	require.ErrorAs(t, err, &pgErr)
+	require.Truef(t, results == nil, "expected nil results, got: %#v", results)
+
+	results, err = pipeline.GetResults()
+	require.NoError(t, err)
+	_, ok = results.(*pgconn.PipelineSync)
+	require.Truef(t, ok, "expected PipelineSync, got: %#v", results)
 
 	err = pipeline.Close()
 	require.NoError(t, err)
@@ -3249,7 +4136,7 @@ func TestPipelineFlushForSingleRequests(t *testing.T) {
 	sd, ok := results.(*pgconn.StatementDescription)
 	require.Truef(t, ok, "expected StatementDescription, got: %#v", results)
 	require.Len(t, sd.Fields, 1)
-	require.Equal(t, "msg", string(sd.Fields[0].Name))
+	require.Equal(t, "msg", sd.Fields[0].Name)
 	require.Equal(t, []uint32{pgtype.TextOID}, sd.ParamOIDs)
 
 	results, err = pipeline.GetResults()
@@ -3346,7 +4233,7 @@ func TestPipelineFlushForRequestSeries(t *testing.T) {
 	sd, ok := results.(*pgconn.StatementDescription)
 	require.Truef(t, ok, "expected StatementDescription, got: %#v", results)
 	require.Len(t, sd.Fields, 1)
-	require.Equal(t, "num", string(sd.Fields[0].Name))
+	require.Equal(t, "num", sd.Fields[0].Name)
 	require.Equal(t, []uint32{pgtype.Int8OID}, sd.ParamOIDs)
 
 	results, err = pipeline.GetResults()
@@ -3565,6 +4452,47 @@ func TestPipelineFlushWithError(t *testing.T) {
 	ensureConnValid(t, pgConn)
 }
 
+func TestPipelineGetResultsHandlesPartiallyReadResults(t *testing.T) {
+	t.Parallel()
+
+	ctx, cancel := context.WithTimeout(context.Background(), 120*time.Second)
+	defer cancel()
+
+	pgConn, err := pgconn.Connect(ctx, os.Getenv("PGX_TEST_DATABASE"))
+	require.NoError(t, err)
+	defer closeConn(t, pgConn)
+
+	sd, err := pgConn.Prepare(ctx, "ps", "select n from generate_series($1::int, $2::int) n", nil)
+	require.NoError(t, err)
+
+	pipeline := pgConn.StartPipeline(ctx)
+	pipeline.SendQueryStatement(sd, [][]byte{[]byte("1"), []byte("3")}, nil, nil)
+	pipeline.SendQueryStatement(sd, [][]byte{[]byte("5"), []byte("7")}, nil, nil)
+	err = pipeline.Sync()
+	require.NoError(t, err)
+
+	results, err := pipeline.GetResults()
+	require.NoError(t, err)
+	rr, ok := results.(*pgconn.ResultReader)
+	require.Truef(t, ok, "expected ResultReader, got: %#v", results)
+	require.True(t, rr.NextRow())
+	require.Equal(t, "1", string(rr.Values()[0]))
+
+	results, err = pipeline.GetResults()
+	require.NoError(t, err)
+	rr, ok = results.(*pgconn.ResultReader)
+	require.Truef(t, ok, "expected ResultReader, got: %#v", results)
+	require.True(t, rr.NextRow())
+	require.Equal(t, "5", string(rr.Values()[0]))
+	require.True(t, rr.NextRow())
+	require.Equal(t, "6", string(rr.Values()[0]))
+
+	err = pipeline.Close()
+	require.NoError(t, err)
+
+	ensureConnValid(t, pgConn)
+}
+
 func TestPipelineCloseReadsUnreadResults(t *testing.T) {
 	t.Parallel()
 
@@ -3575,6 +4503,9 @@ func TestPipelineCloseReadsUnreadResults(t *testing.T) {
 	require.NoError(t, err)
 	defer closeConn(t, pgConn)
 
+	sd, err := pgConn.Prepare(ctx, "ps", "select $1::text as msg", nil)
+	require.NoError(t, err)
+
 	pipeline := pgConn.StartPipeline(ctx)
 	pipeline.SendQueryParams(`select 1`, nil, nil, nil, nil)
 	pipeline.SendQueryParams(`select 2`, nil, nil, nil, nil)
@@ -3584,6 +4515,11 @@ func TestPipelineCloseReadsUnreadResults(t *testing.T) {
 
 	pipeline.SendQueryParams(`select 4`, nil, nil, nil, nil)
 	pipeline.SendQueryParams(`select 5`, nil, nil, nil, nil)
+	err = pipeline.Sync()
+	require.NoError(t, err)
+
+	pipeline.SendQueryStatement(sd, [][]byte{[]byte("6")}, nil, nil)
+	pipeline.SendQueryStatement(sd, [][]byte{[]byte("7")}, nil, nil)
 	err = pipeline.Sync()
 	require.NoError(t, err)
 
@@ -3667,7 +4603,7 @@ func TestConnOnPgError(t *testing.T) {
 	assert.Error(t, err)
 	assert.False(t, pgConn.IsClosed())
 
-	_, err = pgConn.Exec(ctx, "select * from non_existant_table").ReadAll()
+	_, err = pgConn.Exec(ctx, "select * from non_existent_table").ReadAll()
 	assert.Error(t, err)
 	assert.True(t, pgConn.IsClosed())
 }
@@ -3694,13 +4630,15 @@ func Example() {
 
 	pgConn, err := pgconn.Connect(ctx, os.Getenv("PGX_TEST_DATABASE"))
 	if err != nil {
-		log.Fatalln(err)
+		fmt.Fprintln(os.Stderr, err)
+		return
 	}
 	defer pgConn.Close(ctx)
 
 	result := pgConn.ExecParams(ctx, "select generate_series(1,3)", nil, nil, nil, nil).Read()
 	if result.Err != nil {
-		log.Fatalln(result.Err)
+		fmt.Fprintln(os.Stderr, result.Err)
+		return
 	}
 
 	for _, row := range result.Rows {
@@ -3797,7 +4735,6 @@ func TestSNISupport(t *testing.T) {
 		},
 	}
 	for _, tt := range tests {
-		tt := tt
 		t.Run(tt.name, func(t *testing.T) {
 			t.Parallel()
 
@@ -3869,7 +4806,7 @@ func TestSNISupport(t *testing.T) {
 				}
 
 				srv.Write(mustEncode((&pgproto3.AuthenticationOk{}).Encode(nil)))
-				srv.Write(mustEncode((&pgproto3.BackendKeyData{ProcessID: 0, SecretKey: 0}).Encode(nil)))
+				srv.Write(mustEncode((&pgproto3.BackendKeyData{ProcessID: 0, SecretKey: []byte{0, 0, 0, 0}}).Encode(nil)))
 				srv.Write(mustEncode((&pgproto3.ReadyForQuery{TxStatus: 'I'}).Encode(nil)))
 
 				serverSNINameChan <- sniHost
@@ -3877,7 +4814,7 @@ func TestSNISupport(t *testing.T) {
 
 			_, port, _ := strings.Cut(ln.Addr().String(), ":")
 			connStr := fmt.Sprintf("sslmode=require host=localhost port=%s %s", port, tt.sni_param)
-			_, err = pgconn.Connect(ctx, connStr)
+			_, _ = pgconn.Connect(ctx, connStr)
 
 			select {
 			case sniHost := <-serverSNINameChan:
@@ -3921,7 +4858,6 @@ func TestConnectWithDirectSSLNegotiation(t *testing.T) {
 	}
 
 	for _, tt := range tests {
-		tt := tt
 		t.Run(tt.name, func(t *testing.T) {
 			t.Parallel()
 
@@ -4076,6 +5012,8 @@ func TestFatalErrorReceivedInPipelineMode(t *testing.T) {
 	steps = append(steps, pgmock.ExpectAnyMessage(&pgproto3.Describe{}))
 	steps = append(steps, pgmock.ExpectAnyMessage(&pgproto3.Parse{}))
 	steps = append(steps, pgmock.ExpectAnyMessage(&pgproto3.Describe{}))
+	steps = append(steps, pgmock.SendMessage(&pgproto3.ParseComplete{}))
+	steps = append(steps, pgmock.SendMessage(&pgproto3.ParameterDescription{}))
 	steps = append(steps, pgmock.SendMessage(&pgproto3.RowDescription{Fields: []pgproto3.FieldDescription{
 		{Name: []byte("mock")},
 	}}))
@@ -4145,11 +5083,262 @@ func TestFatalErrorReceivedInPipelineMode(t *testing.T) {
 	require.Error(t, err)
 }
 
+// https://github.com/jackc/pgx/issues/2470
+// When the server sends multiple FATAL errors in a single batch (as PgBouncer can do when
+// terminating idle-in-transaction connections), Pipeline.Close() must not panic with
+// "close of closed channel" on cleanupDone. The first FATAL triggers OnPgError which closes
+// the connection and cleanupDone. The second FATAL, still in the read buffer, must not
+// attempt to close cleanupDone again.
+//
+// This test sends all server responses in a single TCP write to guarantee both FATAL errors
+// are in the chunkReader buffer simultaneously.
+func TestPipelineCloseDoesNotPanicOnMultipleFatalErrors(t *testing.T) {
+	t.Parallel()
+
+	ctx, cancel := context.WithTimeout(context.Background(), 120*time.Second)
+	defer cancel()
+
+	ln, err := net.Listen("tcp", "127.0.0.1:")
+	require.NoError(t, err)
+	defer ln.Close()
+
+	serverErrChan := make(chan error, 1)
+	go func() {
+		defer close(serverErrChan)
+
+		conn, err := ln.Accept()
+		if err != nil {
+			serverErrChan <- err
+			return
+		}
+		defer conn.Close()
+
+		err = conn.SetDeadline(time.Now().Add(59 * time.Second))
+		if err != nil {
+			serverErrChan <- err
+			return
+		}
+
+		backend := pgproto3.NewBackend(conn, conn)
+
+		// Handle startup
+		_, err = backend.ReceiveStartupMessage()
+		if err != nil {
+			serverErrChan <- err
+			return
+		}
+		backend.Send(&pgproto3.AuthenticationOk{})
+		backend.Send(&pgproto3.BackendKeyData{ProcessID: 0, SecretKey: []byte{0, 0, 0, 0}})
+		backend.Send(&pgproto3.ReadyForQuery{TxStatus: 'I'})
+		err = backend.Flush()
+		if err != nil {
+			serverErrChan <- err
+			return
+		}
+
+		// Read all client pipeline messages (Parse, Describe, Parse, Describe, Sync)
+		for range 5 {
+			_, err = backend.Receive()
+			if err != nil {
+				serverErrChan <- err
+				return
+			}
+		}
+
+		// Send ALL responses in a single write so they all end up in the chunkReader buffer.
+		// This simulates PgBouncer sending a FATAL and then the real PostgreSQL also sending
+		// a FATAL, both arriving in the same TCP segment.
+		backend.Send(&pgproto3.ParseComplete{})
+		backend.Send(&pgproto3.ParameterDescription{})
+		backend.Send(&pgproto3.RowDescription{Fields: []pgproto3.FieldDescription{
+			{Name: []byte("mock")},
+		}})
+		// Two FATAL errors back-to-back in the same write buffer
+		backend.Send(&pgproto3.ErrorResponse{Severity: "FATAL", Code: "57P01", Message: "terminating connection due to administrator command"})
+		backend.Send(&pgproto3.ErrorResponse{Severity: "FATAL", Code: "57P01", Message: "terminating connection due to administrator command"})
+		err = backend.Flush()
+		if err != nil {
+			serverErrChan <- err
+			return
+		}
+	}()
+
+	parts := strings.Split(ln.Addr().String(), ":")
+	host := parts[0]
+	port := parts[1]
+	connStr := fmt.Sprintf("sslmode=disable host=%s port=%s", host, port)
+
+	ctx, cancel = context.WithTimeout(ctx, 59*time.Second)
+	defer cancel()
+	conn, err := pgconn.Connect(ctx, connStr)
+	require.NoError(t, err)
+
+	pipeline := conn.StartPipeline(ctx)
+	pipeline.SendPrepare("s1", "select 1", nil)
+	pipeline.SendPrepare("s2", "select 2", nil)
+	err = pipeline.Sync()
+	require.NoError(t, err)
+
+	// Do NOT call GetResults. Call Close() directly so it drains results via getResults().
+	// The first FATAL closes the connection via OnPgError, including close(cleanupDone).
+	// The second FATAL is still buffered in chunkReader. Without the fix, processing it
+	// would attempt to close cleanupDone again, causing a panic.
+	err = pipeline.Close()
+	require.Error(t, err)
+}
+
 func mustEncode(buf []byte, err error) []byte {
 	if err != nil {
 		panic(err)
 	}
 	return buf
+}
+
+// https://github.com/jackc/pgx/issues/2584
+//
+// When a context is canceled while the server is mid-stream, asyncClose must drain the socket
+// before closing it. Closing a TCP socket with unread data in the kernel receive buffer causes
+// the OS to send RST instead of FIN, which surfaces on the server / proxy as "connection reset by
+// peer". This test floods the client with DataRows, cancels the context, and asserts the mock
+// server sees Terminate followed by a clean EOF rather than ECONNRESET.
+func TestAsyncCloseDrainsBeforeClose(t *testing.T) {
+	t.Parallel()
+
+	ln, err := net.Listen("tcp", "127.0.0.1:")
+	require.NoError(t, err)
+	defer ln.Close()
+
+	type serverResult struct {
+		gotTerminate bool
+		readErr      error
+	}
+	serverDone := make(chan serverResult, 1)
+
+	go func() {
+		var res serverResult
+		defer func() { serverDone <- res }()
+
+		conn, err := ln.Accept()
+		if err != nil {
+			res.readErr = err
+			return
+		}
+		defer conn.Close()
+		conn.SetDeadline(time.Now().Add(30 * time.Second))
+
+		// asyncClose dials a second connection to deliver CancelRequest and then blocks on a Read
+		// until the server closes (libpq does the same). Accept it, consume the request, and close
+		// promptly so asyncClose proceeds to Terminate. Spawned after the primary Accept() so there
+		// is no race over which goroutine gets the first connection.
+		go func() {
+			c, err := ln.Accept()
+			if err != nil {
+				return
+			}
+			defer c.Close()
+			c.SetDeadline(time.Now().Add(5 * time.Second))
+			io.ReadFull(c, make([]byte, 16)) // len + code + pid + 4-byte secret
+		}()
+
+		backend := pgproto3.NewBackend(conn, conn)
+
+		if _, err := backend.ReceiveStartupMessage(); err != nil {
+			res.readErr = err
+			return
+		}
+		backend.Send(&pgproto3.AuthenticationOk{})
+		backend.Send(&pgproto3.BackendKeyData{ProcessID: 0, SecretKey: []byte{0, 0, 0, 0}})
+		backend.Send(&pgproto3.ReadyForQuery{TxStatus: 'I'})
+		if err := backend.Flush(); err != nil {
+			res.readErr = err
+			return
+		}
+
+		// Read the simple Query message.
+		if _, err := backend.Receive(); err != nil {
+			res.readErr = err
+			return
+		}
+
+		backend.Send(&pgproto3.RowDescription{Fields: []pgproto3.FieldDescription{{Name: []byte("n")}}})
+		if err := backend.Flush(); err != nil {
+			res.readErr = err
+			return
+		}
+
+		// Flood DataRows. Use a payload large enough that the client's kernel receive buffer holds
+		// unread data at the moment of cancellation; without the drain in asyncClose, the client's
+		// Close() would emit RST and the server's subsequent Receive() would see ECONNRESET. Stop
+		// when the client closes its write side or the socket buffers are full enough that we have
+		// blocked past the cancel point; either way fall through to read Terminate.
+		row := &pgproto3.DataRow{Values: [][]byte{bytes.Repeat([]byte("x"), 1024)}}
+		conn.SetWriteDeadline(time.Now().Add(2 * time.Second))
+		for range 16 * 1024 {
+			backend.Send(row)
+			if err := backend.Flush(); err != nil {
+				break
+			}
+		}
+		conn.SetWriteDeadline(time.Time{})
+
+		// The client's asyncClose sends Terminate and then drains until we close. Read until we see
+		// Terminate, then half-close our write side so the client's drain observes EOF and proceeds
+		// to Close() its end.
+		conn.SetReadDeadline(time.Now().Add(20 * time.Second))
+		for {
+			msg, err := backend.Receive()
+			if err != nil {
+				res.readErr = err
+				return
+			}
+			if _, ok := msg.(*pgproto3.Terminate); ok {
+				res.gotTerminate = true
+				break
+			}
+		}
+
+		// Half-close: send FIN to the client so its io.Copy(io.Discard, ...) returns io.EOF, while
+		// keeping our read side open to observe how the client closes. A clean client close yields
+		// io.EOF here; an abortive close (RST due to unread data) yields ECONNRESET.
+		conn.(*net.TCPConn).CloseWrite()
+		buf := make([]byte, 1)
+		_, res.readErr = conn.Read(buf)
+	}()
+
+	host, port, _ := strings.Cut(ln.Addr().String(), ":")
+	connStr := fmt.Sprintf("sslmode=disable host=%s port=%s", host, port)
+
+	conn, err := pgconn.Connect(context.Background(), connStr)
+	require.NoError(t, err)
+
+	queryCtx, queryCancel := context.WithCancel(context.Background())
+	mrr := conn.Exec(queryCtx, "select n from generate_series(1,1000000) n")
+	require.True(t, mrr.NextResult())
+	rr := mrr.ResultReader()
+
+	// Read a handful of rows so the server is definitely streaming, then cancel.
+	for i := 0; i < 50 && rr.NextRow(); i++ {
+	}
+	queryCancel()
+	for rr.NextRow() {
+	}
+	rr.Close()
+	mrr.Close()
+
+	// asyncClose runs in a background goroutine; wait for it (and the drain) to finish.
+	select {
+	case <-conn.CleanupDone():
+	case <-time.After(30 * time.Second):
+		t.Fatal("timed out waiting for client cleanup")
+	}
+
+	select {
+	case res := <-serverDone:
+		require.True(t, res.gotTerminate, "server never received Terminate message")
+		require.ErrorIs(t, res.readErr, io.EOF, "server saw %v, expected clean EOF (FIN); RST indicates the client closed with unread data", res.readErr)
+	case <-time.After(30 * time.Second):
+		t.Fatal("timed out waiting for server")
+	}
 }
 
 func TestDeadlineContextWatcherHandler(t *testing.T) {
@@ -4278,7 +5467,7 @@ func TestCancelRequestContextWatcherHandler(t *testing.T) {
 		require.True(t, pgConn.IsClosed())
 	})
 
-	for i := 0; i < 10; i++ {
+	for i := range 10 {
 		t.Run(fmt.Sprintf("Stress %d", i), func(t *testing.T) {
 			t.Parallel()
 
@@ -4297,7 +5486,7 @@ func TestCancelRequestContextWatcherHandler(t *testing.T) {
 			require.NoError(t, err)
 			defer closeConn(t, pgConn)
 
-			for i := 0; i < 20; i++ {
+			for range 20 {
 				func() {
 					ctx, cancel := context.WithTimeout(context.Background(), 4*time.Millisecond)
 					defer cancel()
@@ -4307,5 +5496,135 @@ func TestCancelRequestContextWatcherHandler(t *testing.T) {
 				}()
 			}
 		})
+	}
+}
+
+// raceProbeHandler implements ctxwatch.Handler. On HandleCancel it synchronously reads pgConn.PID() and
+// pgConn.SecretKey() — the same fields that CancelRequestContextWatcherHandler's spawned goroutine reads via
+// CancelRequest. Reading synchronously inside HandleCancel guarantees the read happens before HandleUnwatchAfterCancel
+// can cancel anything, eliminating the timing-window flakiness of the real handler and making this a reliable
+// race-detector reproducer for the underlying issue: during connect, *PgConn-reading handlers race with the auth loop's
+// writes to pgConn.pid and pgConn.secretKey when BackendKeyData arrives.
+type raceProbeHandler struct {
+	conn *pgconn.PgConn
+	pid  uint32
+	key  []byte
+}
+
+func (h *raceProbeHandler) HandleCancel(context.Context) {
+	h.pid = h.conn.PID()
+	h.key = h.conn.SecretKey()
+}
+
+func (h *raceProbeHandler) HandleUnwatchAfterCancel() {}
+
+// TestConnectContextCancelHandlerRace reproduces the data race that occurred when the application-supplied
+// BuildContextWatcherHandler was armed during the connect handshake. If the context was cancelled while connectOne was
+// still running, a handler that reads *PgConn fields (such as CancelRequestContextWatcherHandler, which calls
+// CancelRequest reading pgConn.pid and pgConn.secretKey) would race with the auth loop's writes to those fields when
+// handling BackendKeyData.
+//
+// The fix is to use the deadline-only handler during connect and only swap in the application-supplied handler after
+// the connection is established.
+//
+// Run with -race to detect the race.
+//
+// Race originally reported in https://github.com/jackc/pgx/pull/2534.
+func TestConnectContextCancelHandlerRace(t *testing.T) {
+	t.Parallel()
+
+	for i := range 10 {
+		t.Run(fmt.Sprintf("Stress %d", i), func(t *testing.T) {
+			t.Parallel()
+
+			script := &pgmock.Script{
+				Steps: []pgmock.Step{
+					pgmock.ExpectAnyMessage(&pgproto3.StartupMessage{ProtocolVersion: pgproto3.ProtocolVersion30, Parameters: map[string]string{}}),
+					pgmock.SendMessage(&pgproto3.AuthenticationOk{}),
+					pgmock.SendMessage(&pgproto3.BackendKeyData{ProcessID: 12345, SecretKey: []byte{1, 2, 3, 4}}),
+					pgmockWaitStep(200 * time.Millisecond),
+					pgmock.SendMessage(&pgproto3.ReadyForQuery{TxStatus: 'I'}),
+				},
+			}
+
+			ln, err := net.Listen("tcp", "127.0.0.1:")
+			require.NoError(t, err)
+			defer ln.Close()
+
+			go func() {
+				conn, err := ln.Accept()
+				if err != nil {
+					return
+				}
+				defer conn.Close()
+				_ = conn.SetDeadline(time.Now().Add(5 * time.Second))
+				_ = script.Run(pgproto3.NewBackend(conn, conn))
+			}()
+
+			host, port, _ := strings.Cut(ln.Addr().String(), ":")
+			connStr := fmt.Sprintf("sslmode=disable host=%s port=%s user=test database=test", host, port)
+			config, err := pgconn.ParseConfig(connStr)
+			require.NoError(t, err)
+			config.BuildContextWatcherHandler = func(conn *pgconn.PgConn) ctxwatch.Handler {
+				return &raceProbeHandler{conn: conn}
+			}
+			config.ConnectTimeout = 5 * time.Second
+
+			ctx, cancel := context.WithCancel(context.Background())
+			// Cancel during the 200ms wait between BackendKeyData and ReadyForQuery,
+			// after the auth loop has written pid/secretKey.
+			time.AfterFunc(50*time.Millisecond, cancel)
+			defer cancel()
+
+			pgConn, err := pgconn.ConnectConfig(ctx, config)
+			if err == nil {
+				closeConn(t, pgConn)
+			}
+		})
+	}
+}
+
+func TestConnectProtocolVersion32(t *testing.T) {
+	t.Parallel()
+
+	ctx, cancel := context.WithTimeout(context.Background(), 120*time.Second)
+	defer cancel()
+
+	// Check if we're connecting to CockroachDB before attempting protocol v3.2, since CockroachDB
+	// does not support protocol version 3.2 and will close the connection.
+	{
+		checkConn, err := pgconn.Connect(ctx, os.Getenv("PGX_TEST_DATABASE"))
+		if err == nil {
+			isCRDB := checkConn.ParameterStatus("crdb_version") != ""
+			checkConn.Close(ctx)
+			if isCRDB {
+				t.Skip("CockroachDB does not support protocol version 3.2 yet")
+			}
+		}
+	}
+
+	config, err := pgconn.ParseConfig(os.Getenv("PGX_TEST_DATABASE"))
+	require.NoError(t, err)
+	config.MaxProtocolVersion = "3.2"
+
+	pgConn, err := pgconn.ConnectConfig(ctx, config)
+	require.NoError(t, err)
+	defer closeConn(t, pgConn)
+
+	result, err := pgConn.Exec(context.Background(), "show server_version_num").ReadAll()
+	require.NoError(t, err)
+	require.Len(t, result, 1)
+	require.Len(t, result[0].Rows, 1)
+	require.Len(t, result[0].Rows[0], 1)
+	pgVersion, err := strconv.Atoi(string(result[0].Rows[0][0]))
+	require.NoError(t, err)
+
+	// Check secret key length - PG18+ returns 32 bytes, older versions return 4
+	secretKey := pgConn.SecretKey()
+
+	if pgVersion < 180000 {
+		assert.Len(t, secretKey, 4)
+	} else {
+		assert.Len(t, secretKey, 32)
 	}
 }
